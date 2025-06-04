@@ -2,11 +2,11 @@ import os
 from OCC.Core.STEPControl import STEPControl_Reader
 from OCC.Core.IFSelect import IFSelect_RetDone
 from OCC.Core.BRep import BRep_Tool
-from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone
+from OCC.Core.GeomAbs import GeomAbs_Cylinder
 from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
-from OCC.Core.TopExp import TopExp_Explorer, topexp_MapShapesAndAncestors
-from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE
-from OCC.Core.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+from OCC.Core.TopExp import TopExp_Explorer
+from OCC.Core.TopAbs import TopAbs_FACE
+from OCC.Core.gp import gp_Ax1
 
 
 def load_step_file(filename):
@@ -18,66 +18,30 @@ def load_step_file(filename):
     shape = step_reader.OneShape()
     return shape
 
-def count_holes_by_type(shape):
-    explorer = TopExp_Explorer(shape, TopAbs_FACE)
-    cylinder_faces = 0
-    cone_faces = 0
+def axis_key(adaptor):
+    """Gera uma chave única simplificada com centro e direção."""
+    axis = adaptor.Cylinder().Axis()
+    loc = axis.Location()
+    dir = axis.Direction()
+    return (
+        round(loc.X(), 2), round(loc.Y(), 2), round(loc.Z(), 2),
+        round(dir.X(), 3), round(dir.Y(), 3), round(dir.Z(), 3)
+    )
 
-    faces = []
+def count_cylindrical_holes_by_axis(shape):
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    axis_set = set()
+
     while explorer.More():
         face = explorer.Current()
-        faces.append(face)
-        explorer.Next()
-
-    # Mapa de todas as arestas e as faces associadas
-    map_faces = TopTools_IndexedDataMapOfShapeListOfShape()
-    topexp_MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, map_faces)
-
-    for face in faces:
         surface = BRep_Tool.Surface(face)
         adaptor = GeomAdaptor_Surface(surface)
-        geom_type = adaptor.GetType()
+        if adaptor.GetType() == GeomAbs_Cylinder:
+            key = axis_key(adaptor)
+            axis_set.add(key)
+        explorer.Next()
 
-        if geom_type not in (GeomAbs_Cylinder, GeomAbs_Cone):
-            continue
-
-        has_cone_neighbor = False
-        edge_explorer = TopExp_Explorer(face, TopAbs_EDGE)
-        while edge_explorer.More():
-            edge = edge_explorer.Current()
-
-            try:
-                neighbor_faces = map_faces.FindFromKey(edge)
-            except:
-                edge_explorer.Next()
-                continue
-
-            neighbors = []
-            i = 1
-            while True:
-                try:
-                    neighbors.append(neighbor_faces.Value(i))
-                    i += 1
-                except:
-                    break
-
-            for neighbor in neighbors:
-                if neighbor.IsSame(face):
-                    continue
-                neighbor_surface = BRep_Tool.Surface(neighbor)
-                neighbor_adaptor = GeomAdaptor_Surface(neighbor_surface)
-                neighbor_type = neighbor_adaptor.GetType()
-                if neighbor_type == GeomAbs_Cone:
-                    has_cone_neighbor = True
-            edge_explorer.Next()
-
-        if geom_type == GeomAbs_Cylinder and not has_cone_neighbor:
-            cylinder_faces += 1
-        elif geom_type == GeomAbs_Cone:
-            cone_faces += 1
-
-    return cylinder_faces // 2, cone_faces // 2
-
+    return len(axis_set)
 
 def analyze_faces(shape):
     from collections import defaultdict
@@ -104,7 +68,6 @@ def analyze_faces(shape):
     else:
         print("Nenhuma face cilíndrica encontrada.")
 
-
 def choose_file_from_folder(folder):
     files = [f for f in os.listdir(folder) if f.lower().endswith('.stp')]
     if not files:
@@ -128,7 +91,6 @@ if __name__ == "__main__":
     filepath = choose_file_from_folder(folder)
     if filepath:
         shape = load_step_file(filepath)
-        num_furos_cil, num_furos_cone = count_holes_by_type(shape)
-        print(f"Número de furos cilíndricos: {num_furos_cil}")
-        print(f"Número de furos cônicos: {num_furos_cone}")
+        num_furos_cil = count_cylindrical_holes_by_axis(shape)
+        print(f"Número estimado de furos cilíndricos: {num_furos_cil}")
         analyze_faces(shape)
