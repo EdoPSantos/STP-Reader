@@ -137,11 +137,11 @@ def choose_file_from_folder(folder):
         print(f"{i+1}: {f}")
 
     while True:
-        choice = input("Número do ficheiro: ")
-        if choice.isdigit():
-            choice = int(choice)
-            if 1 <= choice <= len(files):
-                return os.path.join(folder, files[choice - 1])
+        escolha = input("Número do ficheiro: ")
+        if escolha.isdigit():
+            escolha = int(escolha)
+            if 1 <= escolha <= len(files):
+                return os.path.join(folder, files[escolha - 1])
         print("Escolha inválida. Tente novamente.")
 
 def analyze_cylindrical_holes(shape):
@@ -183,44 +183,7 @@ def analyze_cylindrical_holes(shape):
         # Comprimento e tipo (passante/cego) podem ser estimados com mais geometria
         print()
 
-        def analyze_conical_holes(shape):
-    print("="*26)
-    print("     FUROS CÔNICOS")
-    print("="*26)
-    explorer = TopExp_Explorer(shape, TopAbs_FACE)
-    con_holes = {}
-
-    while explorer.More():
-        face = explorer.Current()
-        surface = BRep_Tool.Surface(face)
-        adaptor = GeomAdaptor_Surface(surface)
-        if adaptor.GetType() == GeomAbs_Cone:
-            key = cone_axis_key(adaptor)
-            cone = adaptor.Cone()
-            radius = round(cone.RefRadius(), 2)
-            diameter = round(2 * radius, 2)
-            axis = cone.Axis()
-            loc = axis.Location()
-            dir = axis.Direction()
-            if key not in con_holes:
-                con_holes[key] = {
-                    "center": (round(loc.X(), 2), round(loc.Y(), 2), round(loc.Z(), 2)),
-                    "direction": (round(dir.X(), 3), round(dir.Y(), 3), round(dir.Z(), 3)),
-                    "radius": radius,
-                    "diameter": diameter
-                }
-        explorer.Next()
-
-    for i, (key, data) in enumerate(con_holes.items(), 1):
-        print(f"Furo cônico {i}:")
-        print(f"  Centro: {data['center']}")
-        print(f"  Direção: {data['direction']}")
-        print(f"  Raio: {data['radius']:.2f}")
-        print(f"  Diâmetro: {data['diameter']:.2f}")
-        print()
-
-    print(f"Total de furos cônicos: {len(con_holes)}\n")
-
+    print(f"Total de furos cilíndricos: {len(holes)}\n")
 
 def analyze_cylindrical_and_conical_holes(shape):
     print("="*26)
@@ -266,9 +229,31 @@ def analyze_cylindrical_and_conical_holes(shape):
                 }
         explorer.Next()
 
+    # Listar furos cilíndricos
+    for i, (key, data) in enumerate(cyl_holes.items(), 1):
+        print(f"Furo cilíndrico {i}:")
+        print(f"  Centro: {data['center']}")
+        print(f"  Direção: {data['direction']}")
+        print(f"  Raio: {data['radius']:.2f}")
+        print(f"  Diâmetro: {data['diameter']:.2f}")
+        print()
+
+    # Listar furos cônicos
+    print("="*26)
+    print("     FUROS CÔNICOS")
+    print("="*26)
+    for i, (key, data) in enumerate(con_holes.items(), 1):
+        print(f"Furo cônico {i}:")
+        print(f"  Centro: {data['center']}")
+        print(f"  Direção: {data['direction']}")
+        print(f"  Raio: {data['radius']:.2f}")
+        print(f"  Diâmetro: {data['diameter']:.2f}")
+        print()
+
+
 if __name__ == "__main__":
-    folder = "viewers"
-    filepath = choose_file_from_folder(folder)
+    pasta = "viewers"
+    filepath = choose_file_from_folder(pasta)
     if filepath:
         shape = load_step_file(filepath)
         while True:
@@ -283,7 +268,38 @@ if __name__ == "__main__":
             elif opcao == "2":
                 analyze_cylindrical_holes(shape)
             elif opcao == "3":
-                analyze_conical_holes(shape)
+                print("="*26)
+                print("     FUROS CÔNICOS")
+                print("="*26)
+                explorer = TopExp_Explorer(shape, TopAbs_FACE)
+                con_holes = {}
+                while explorer.More():
+                    face = explorer.Current()
+                    surface = BRep_Tool.Surface(face)
+                    adaptor = GeomAdaptor_Surface(surface)
+                    if adaptor.GetType() == GeomAbs_Cone:
+                        key = cone_axis_key(adaptor)
+                        cone = adaptor.Cone()
+                        radius = round(cone.RefRadius(), 2)
+                        diameter = round(2 * radius, 2)
+                        axis = cone.Axis()
+                        loc = axis.Location()
+                        dir = axis.Direction()
+                        if key not in con_holes:
+                            con_holes[key] = {
+                                "center": (round(loc.X(), 2), round(loc.Y(), 2), round(loc.Z(), 2)),
+                                "direction": (round(dir.X(), 3), round(dir.Y(), 3), round(dir.Z(), 3)),
+                                "radius": radius,
+                                "diameter": diameter
+                            }
+                    explorer.Next()
+                for i, (key, data) in enumerate(con_holes.items(), 1):
+                    print(f"Furo cônico {i}:")
+                    print(f"  Centro: {data['center']}")
+                    print(f"  Direção: {data['direction']}")
+                    print(f"  Raio: {data['radius']:.2f}")
+                    print(f"  Diâmetro: {data['diameter']:.2f}")
+                    print()
             elif opcao == "0":
                 print("Saindo...")
                 break
