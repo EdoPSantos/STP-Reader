@@ -1,9 +1,10 @@
-# Ambiente virtual
+# Ambiente virtual (Conda ou venv)
 venv*/
+stp_venv/
 .env/
 *.env
 
-# Ficheiros temporários / de sistema
+# Ficheiros temporários / compilados do Python
 __pycache__/
 *.pyc
 *.pyo
@@ -14,18 +15,20 @@ __pycache__/
 .vscode/
 .idea/
 
-# Ficheiros STEP e outros CAD
-*.stp
-*.step
-*.iges
-*.igs
+# Ficheiros STEP e outros CAD de entrada (devem ser colocados localmente)
+stp_igs_files/*.stp
+stp_igs_files/*.step
+stp_igs_files/*.iges
+stp_igs_files/*.igs
 
-# Ficheiros de imagem ou grandes para visualização
+# Ficheiros de imagem (ex: screenshots)
+screenshots/
 *.png
 *.jpg
 *.jpeg
 *.gif
 
-# Outros
+# Outros (macOS, Windows)
 .DS_Store
 Thumbs.db
+Desktop.ini
