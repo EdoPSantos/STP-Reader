@@ -69,4 +69,4 @@ def show_circular_hole_details(diameters):
 
     print("\n=== DETALHES DOS FUROS CIRCULARES ===")
     for diameter, count in sorted(counter.items(), key=lambda x: x[0], reverse=True):
-        print(f"-- {count} furo(s) com Ø {diameter} --")
+        print(f"-- {count} furo(s) com {diameter} de diâmetro --")
