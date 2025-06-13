@@ -1,16 +1,15 @@
-# Funções utilitárias para gerar chaves únicas com base nos eixos dos furos
+from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone
 
 def axis_key(adaptor):
-    axis = adaptor.Cylinder().Axis()
-    loc = axis.Location()
-    dir = axis.Direction()
-    return (
-        round(loc.X(), 2), round(loc.Y(), 2), round(loc.Z(), 2),
-        round(dir.X(), 3), round(dir.Y(), 3), round(dir.Z(), 3)
-    )
+    surface_type = adaptor.GetType()
 
-def cone_axis_key(adaptor):
-    axis = adaptor.Cone().Axis()
+    if surface_type == GeomAbs_Cylinder:
+        axis = adaptor.Cylinder().Axis()
+    elif surface_type == GeomAbs_Cone:
+        axis = adaptor.Cone().Axis()
+    else:
+        raise ValueError("Tipo de superfície não suportado em axis_key")
+
     loc = axis.Location()
     dir = axis.Direction()
     return (

@@ -28,7 +28,7 @@ screenshots/
 *.jpeg
 *.gif
 
-# Outros (macOS, Windows)
+# Outros (Windows)
 .DS_Store
 Thumbs.db
 Desktop.ini
