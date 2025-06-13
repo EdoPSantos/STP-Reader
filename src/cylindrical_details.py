@@ -4,29 +4,35 @@ from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_VERTEX
 from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone
+from OCC.Core.gp import gp_Pnt
+from .utils import is_hole_through
 
 def get_max_radius_of_cone_face(face, adaptor):
-    """Calcula o maior raio real dos vértices de uma face cônica."""
+    # Calcula o maior raio real dos vértices de uma face cônica
     cone = adaptor.Cone()
     ref_radius = cone.RefRadius()
     semi_angle = cone.SemiAngle()
     z0 = cone.Location().Z()
-    
     vertex_explorer = TopExp_Explorer(face, TopAbs_VERTEX)
     max_radius = 0
     while vertex_explorer.More():
         vertex = vertex_explorer.Current()
         pnt = BRep_Tool.Pnt(vertex)
-        # Raio real naquele ponto (Z)
         radius = abs(ref_radius + (pnt.Z() - z0) * math.tan(semi_angle))
         if radius > max_radius:
             max_radius = radius
         vertex_explorer.Next()
     return max_radius
 
-def get_circular_hole_diameters(shape):
-    # Dicionário para guardar o maior diâmetro por centro (X, Y)
-    center_to_max_diameter = dict()
+def get_circular_hole_diameters_by_type(shape):
+    """
+    Agrupa faces cilíndricas e cônicas pelo centro e direção.
+    Usa a função is_hole_through para distinguir furos passantes e fechados.
+    """
+    from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone
+    from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
+
+    center_to_data = dict()
     explorer = TopExp_Explorer(shape, TopAbs_FACE)
 
     while explorer.More():
@@ -37,36 +43,53 @@ def get_circular_hole_diameters(shape):
         if stype == GeomAbs_Cylinder:
             axis = adaptor.Cylinder().Axis()
             loc = axis.Location()
-            x, y = round(loc.X(), 2), round(loc.Y(), 2)
+            dir = axis.Direction()
+            x, y, z = loc.X(), loc.Y(), loc.Z()
             radius = adaptor.Cylinder().Radius()
         elif stype == GeomAbs_Cone:
             axis = adaptor.Cone().Axis()
             loc = axis.Location()
-            x, y = round(loc.X(), 2), round(loc.Y(), 2)
+            dir = axis.Direction()
+            x, y, z = loc.X(), loc.Y(), loc.Z()
             radius = get_max_radius_of_cone_face(face, adaptor)
         else:
             explorer.Next()
             continue
 
         diameter = round(radius * 2, 2)
-
-        # Guarda apenas o maior diâmetro para cada (x, y)
-        if (x, y) not in center_to_max_diameter or diameter > center_to_max_diameter[(x, y)]:
-            center_to_max_diameter[(x, y)] = diameter
-
+        key = (round(x, 2), round(y, 2), round(z, 2), round(dir.X(), 3), round(dir.Y(), 3), round(dir.Z(), 3))
+        if key not in center_to_data:
+            center_to_data[key] = []
+        center_to_data[key].append((face, diameter, loc, dir))
         explorer.Next()
 
-    # Retorna apenas os maiores diâmetros por centro
-    return list(center_to_max_diameter.values())
+    diameters_through = []
+    diameters_closed = []
 
-def show_circular_hole_details(diameters):
-    if not diameters:
-        print("-- Nenhum furo circular --\n")
-        return
+    for group in center_to_data.values():
+        # Assume que todas as faces do grupo têm mesmo centro e direção
+        face, diameter, loc, dir = group[0]
+        if is_hole_through(loc, dir, shape):
+            diameters_through.append(diameter)
+        else:
+            diameters_closed.append(diameter)
+    return diameters_through, diameters_closed
 
+def show_circular_hole_details(diameters_through, diameters_closed):
     from collections import Counter
-    counter = Counter(diameters)  # agrupa os diâmetros já arredondados
 
-    print("\n=== DETALHES DOS FUROS CIRCULARES ===")
-    for diameter, count in sorted(counter.items(), key=lambda x: x[0], reverse=True):
-        print(f"-- {count} furo(s) com {diameter} de diâmetro --")
+    print("\n=== DETALHES DOS FUROS CIRCULARES SEM FUNDO ===")
+    if not diameters_through:
+        print("-- Nenhum furo circular sem fundo --\n")
+    else:
+        counter = Counter(diameters_through)
+        for diameter, count in sorted(counter.items(), key=lambda x: x[0], reverse=True):
+            print(f"-- {count} furo(s) com {diameter} de diâmetro --")
+
+    print("\n=== DETALHES DOS FUROS CIRCULARES COM FUNDO ===")
+    if not diameters_closed:
+        print("-- Nenhum furo circular com fundo --\n")
+    else:
+        counter = Counter(diameters_closed)
+        for diameter, count in sorted(counter.items(), key=lambda x: x[0], reverse=True):
+            print(f"-- {count} furo(s) com {diameter} de diâmetro --")

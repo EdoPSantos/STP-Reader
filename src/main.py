@@ -1,6 +1,6 @@
 from .loader import load_step_file, choose_file_from_folder 
 from .main_details import classify_and_summarize_holes
-from .cylindrical_details import get_circular_hole_diameters, show_circular_hole_details
+from .cylindrical_details import get_circular_hole_diameters_by_type, show_circular_hole_details
 from .rectangular_details import show_rectangular_details
 
 
@@ -26,13 +26,11 @@ def main():
             classify_and_summarize_holes(shape, filepath)
 
         elif opcao == "2":
-            circular = get_circular_hole_diameters(shape)
-            show_circular_hole_details(circular)
-
+            diameters_through, diameters_closed = get_circular_hole_diameters_by_type(shape)
+            show_circular_hole_details(diameters_through, diameters_closed)
         elif opcao == "3":
             rectangular = []  # A ser implementado futuramente com deteção geométrica de furos retangulares
             show_rectangular_details(rectangular)
-
         elif opcao == "4":
             new_path = choose_file_from_folder(folder)
             if new_path:

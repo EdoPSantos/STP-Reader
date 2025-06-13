@@ -5,9 +5,22 @@ from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.TopAbs import TopAbs_FACE
 from OCC.Core.Bnd import Bnd_Box
-from OCC.Core.BRepBndLib import brepbndlib_Add
+from OCC.Core.BRepBndLib import brepbndlib
 from collections import defaultdict
-from .utils import axis_key
+from .utils import axis_key, is_hole_through
+
+def extract_from_filename(filepath):
+    """
+    Extrai o molde e a peça do nome do ficheiro físico.
+    Exemplo: lixo_M251799_1-1.stp => molde=M251799, peça=1-1
+    """
+    base = os.path.basename(filepath)
+    name, _ = os.path.splitext(base)
+    import re
+    parts = re.split(r"[_\-]", name)
+    if len(parts) >= 2:
+        return parts[-2], parts[-1]
+    return None, None
 
 def extract_mold_and_part_from_step(filepath):
     """
@@ -16,7 +29,7 @@ def extract_mold_and_part_from_step(filepath):
     3. Depois PRODUCT.
     4. Se não encontrar, devolve (None, None)
     """
-    import re, os
+    import re
 
     # 1. Nome do ficheiro físico
     file_mold, file_part = extract_from_filename(filepath)
@@ -53,21 +66,6 @@ def extract_mold_and_part_from_step(filepath):
         return product_mold, product_part
     return None, None
 
-def extract_from_filename(filepath):
-    """
-    Extrai o molde e a peça do nome do ficheiro físico.
-    Exemplo: lixo_M251799_1-1.stp => molde=M251799, peça=1-1
-    """
-    base = os.path.basename(filepath)
-    name, _ = os.path.splitext(base)
-    # Divide por "_" ou "-"
-    import re
-    parts = re.split(r"[_\-]", name)
-    # Se existirem pelo menos duas partes, os últimos são molde e peça
-    if len(parts) >= 2:
-        return parts[-2], parts[-1]
-    return None, None
-
 def group_faces_by_axis(shape):
     """Agrupa faces cilíndricas pelo eixo."""
     explorer = TopExp_Explorer(shape, TopAbs_FACE)
@@ -87,12 +85,41 @@ def group_faces_by_axis(shape):
 
     return axis_groups
 
+def is_face_exterior(face, shape):
+    """
+    Verifica se uma face está na superfície exterior da peça (shell).
+    Abordagem básica: compara bounding box dos vértices da face com bounding box global.
+    """
+    from OCC.Core.TopExp import TopExp_Explorer
+    from OCC.Core.TopAbs import TopAbs_VERTEX
+    from OCC.Core.BRep import BRep_Tool
+
+    bbox = Bnd_Box()
+    brepbndlib.Add(shape, bbox)
+    global_bounds = bbox.Get()  # (xmin, ymin, zmin, xmax, ymax, zmax)
+
+    # Bounding box da face
+    face_bbox = Bnd_Box()
+    vertex_explorer = TopExp_Explorer(face, TopAbs_VERTEX)
+    while vertex_explorer.More():
+        vertex = vertex_explorer.Current()
+        pnt = BRep_Tool.Pnt(vertex)
+        face_bbox.Update(pnt.X(), pnt.Y(), pnt.Z())
+        vertex_explorer.Next()
+    face_bounds = face_bbox.Get()
+
+    # Se algum vértice da face está quase colado ao bounding box global => é exterior
+    tol = 1e-3
+    for i in range(3):
+        if abs(face_bounds[i] - global_bounds[i]) < tol or abs(face_bounds[i+3] - global_bounds[i+3]) < tol:
+            return True
+    return False
+
 def classify_and_summarize_holes(shape, filepath=None):
     # --- Extrai nome de molde e peça ---
     mold, part = None, None
     if filepath:
         mold, part = extract_mold_and_part_from_step(filepath)
-        # Se não identificou, mostra mensagem padrão
         mold_name = f"Molde: {mold}" if mold else "Molde: (não identificado)"
         part_name = f"Peça: {part}" if part else "Peça: (não identificada)"
     else:
@@ -101,7 +128,7 @@ def classify_and_summarize_holes(shape, filepath=None):
 
     # --- Bounding Box ---
     bbox = Bnd_Box()
-    brepbndlib_Add(shape, bbox)
+    brepbndlib.Add(shape, bbox)
     xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
     length = abs(xmax - xmin)
     width = abs(ymax - ymin)
@@ -132,8 +159,13 @@ def classify_and_summarize_holes(shape, filepath=None):
     count_rectangular_through = 0
     count_rectangular_closed = 0
 
+    # Novo: verifica se as faces do grupo tocam superfícies externas
     for faces, _ in grouped_by_center.values():
-        if len(faces) >= 2:
+    # Assume que todas as faces do grupo pertencem ao mesmo furo
+        _, face, adaptor = faces[0]
+        loc = adaptor.Cylinder().Axis().Location()
+        dir = adaptor.Cylinder().Axis().Direction()
+        if is_hole_through(loc, dir, shape):
             count_cylindrical_through += 1
         else:
             count_cylindrical_closed += 1
