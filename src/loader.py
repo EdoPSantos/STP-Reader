@@ -10,6 +10,8 @@ def load_step_file(filename):
         raise Exception("Erro ao ler ficheiro STEP")
     step_reader.TransferRoots()
     shape = step_reader.OneShape()
+    if shape.IsNull():
+        raise Exception("Shape inválido ou vazio")
     return shape
 
 # Função para permitir seleção do ficheiro no terminal
