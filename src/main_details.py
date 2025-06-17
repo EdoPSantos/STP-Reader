@@ -1,71 +1,19 @@
 from OCC.Core.BRep import BRep_Tool
-from OCC.Core.GeomAbs import GeomAbs_Cylinder
+from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone
 from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.TopAbs import TopAbs_FACE
 from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepBndLib import brepbndlib
 from collections import defaultdict
-from .utils import get_min_max_cylindrical_diameter, group_faces_by_axis
+from .utils import extract_from_filename, extract_mold_and_part_from_step, detect_positions_from_holes, group_faces_by_axis
 
 import os
 import re
 
-def extract_from_filename(filepath):
-    """
-    Extrai o nome do molde e da peça a partir do nome do ficheiro.
-    """
-    base = os.path.basename(filepath)
-    name, _ = os.path.splitext(base)
-    parts = re.split(r"[_\-]", name)
-    if len(parts) >= 2:
-        return parts[-2], parts[-1]
-    return None, None
-
-def extract_mold_and_part_from_step(filepath):
-    """
-    Tenta extrair molde e peça a partir do ficheiro STEP.
-    Procura por nome do ficheiro e por entradas PRODUCT no texto.
-    """
-    file_mold, file_part = extract_from_filename(filepath)
-    if file_mold and file_part:
-        return file_mold, file_part
-
-    mold, part = None, None
-    product_mold, product_part = None, None
-    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            if "FILE_NAME" in line and (mold is None or part is None):
-                match = re.search(r"FILE_NAME\('([^']+)'", line)
-                if match:
-                    filename = match.group(1)
-                    base = os.path.basename(filename)
-                    name, _ = os.path.splitext(base)
-                    parts = re.split(r"[_\-]", name)
-                    if len(parts) >= 2:
-                        mold = parts[-2]
-                        part = parts[-1]
-            if "PRODUCT('" in line and (product_mold is None or product_part is None):
-                match = re.search(r"PRODUCT\('([^']+)'", line)
-                if match:
-                    pname = match.group(1)
-                    parts = re.split(r"[_\-]", pname)
-                    if len(parts) >= 2:
-                        product_mold = parts[-2]
-                        product_part = parts[-1]
-
-    if mold and part:
-        return mold, part
-    elif product_mold and product_part:
-        return product_mold, product_part
-    return None, None
-
 def show_general_summary(shape, filepath=None):
-    """
-    Mostra apenas os campos principais para preenchimento do GESTi:
-    Molde, Peça, Largura, Comprimento, Posições, Qtd. furos cilíndricos, Qtd. furos retangulares.
-    """
-    # Extrai o molde e a peça
+    from collections import Counter
+
     mold, part = None, None
     if filepath:
         mold, part = extract_mold_and_part_from_step(filepath)
@@ -75,35 +23,33 @@ def show_general_summary(shape, filepath=None):
         mold_name = "(desconhecido)"
         part_name = "(desconhecida)"
 
-    # Calcula bounding box
     bbox = Bnd_Box()
     brepbndlib.Add(shape, bbox)
     xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
     length = abs(xmax - xmin)
     width = abs(ymax - ymin)
 
-    # Conta furos cilíndricos (por eixo)
     axis_groups = group_faces_by_axis(shape)
     count_cylindrical = len(axis_groups)
 
-    # Lista dos diâmetros de cada furo
     diameters = []
-    from OCC.Core.GeomAbs import GeomAbs_Cylinder
     for faces in axis_groups:
-        only_cylinders = all(stype == GeomAbs_Cylinder for stype, _, _ in faces)
-        if only_cylinders:
-            for stype, face, adaptor in faces:
-                diameters.append(round(adaptor.Cylinder().Radius() * 2, 2))
+        radii = []
+        for stype, face, adaptor in faces:
+            if stype == GeomAbs_Cylinder:
+                r = adaptor.Cylinder().Radius()
+                if r > 0:
+                    radii.append(round(r * 2, 2))
+        if radii:
+            diameters.append(max(radii))
 
-    # Conta furos retangulares - placeholder para implementar
     count_rectangular = 0
 
-    # Detectar automaticamente número de posições (exemplo: sempre 1)
-    positions = 1  # Podes substituir por uma função tipo detect_positions(shape)
+    positions = detect_positions_from_holes(axis_groups, shape)
 
-    print("="*40)
+    print("=" * 40)
     print("   RESUMO DA PEÇA PARA O GESTi")
-    print("="*40)
+    print("=" * 40)
     print(f"Molde: {mold_name}")
     print(f"Peça: {part_name}")
     print(f"Largura: {width:.0f} mm")
@@ -111,9 +57,14 @@ def show_general_summary(shape, filepath=None):
     print(f"Posições: {positions}")
     print(f"Qtd. furos cilíndricos: {count_cylindrical}")
     print(f"Qtd. furos quadrados: {count_rectangular}")
-    print("-"*40)
+    print("-" * 40)
+
     if diameters:
-        print("Diâmetro dos furos cilíndricos:", ', '.join(str(d) + " mm" for d in sorted(set(diameters))))
+        print("Diâmetro dos furos cilíndricos:")
+        counter = Counter(diameters)
+        for diameter, count in sorted(counter.items(), key=lambda x: -x[0]):
+            print(f"  Tem {count} furo(s) com {diameter} mm")
     else:
-        print("Diâmetro  dos furos cilíndricos: -")
-    print("="*40)
+        print("Diâmetro dos furos cilíndricos: -")
+
+    print("=" * 40)

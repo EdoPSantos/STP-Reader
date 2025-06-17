@@ -1,11 +1,12 @@
-# codigo parecido com o cylindrical details.py mas para retangulos ou formatos que não sejão cilindricos
+from .utils import group_rectangular_faces
 
-def show_rectangular_details(rectangular_holes):
-    if not rectangular_holes:
-        print("-- Nenhum furo retangular --\n")
+def show_rectangular_details(shape):
+    holes = group_rectangular_faces(shape)
+    if not holes:
+        print("-- Nenhum furo retangular --\\n")
         return
 
     print("-- Furos retangulares --")
-    for i, faces in enumerate(rectangular_holes, 1):
-        print(f"Furo {i}: {len(faces)} face(s) (detalhes não implementados)")
+    for i, face in enumerate(holes, 1):
+        print(f"Furo {i}: 1 face (detalhes ainda não implementados)")
     print()

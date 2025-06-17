@@ -1,4 +1,10 @@
-from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone
+# === Funções Globais (usadas por múltiplos ficheiros) ===
+
+import os
+import re
+from collections import defaultdict
+
+from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Plane
 from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
 from OCC.Core.gp import gp_Pnt
 from OCC.Core.Bnd import Bnd_Box
@@ -6,7 +12,8 @@ from OCC.Core.BRepBndLib import brepbndlib
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.TopAbs import TopAbs_VERTEX, TopAbs_FACE
-from collections import defaultdict
+
+# Utilitário para gerar chave de agrupamento de furos por eixo
 
 def axis_key(adaptor):
     surface_type = adaptor.GetType()
@@ -23,49 +30,7 @@ def axis_key(adaptor):
         round(dir.X(), 3), round(dir.Y(), 3), round(dir.Z(), 3)
     )
 
-def get_all_vertices_of_group(faces):
-    vertices = []
-    for face in faces:
-        explorer = TopExp_Explorer(face, TopAbs_VERTEX)
-        while explorer.More():
-            v = explorer.Current()
-            vertices.append(BRep_Tool.Pnt(v))
-            explorer.Next()
-    return vertices
-
-def get_bbox_faces_touched(pnt, bbox, tol=0.5):
-    xmin, ymin, zmin, xmax, ymax, zmax = bbox
-    faces = []
-    if abs(pnt.X() - xmin) < tol: faces.append("xmin")
-    if abs(pnt.X() - xmax) < tol: faces.append("xmax")
-    if abs(pnt.Y() - ymin) < tol: faces.append("ymin")
-    if abs(pnt.Y() - ymax) < tol: faces.append("ymax")
-    if abs(pnt.Z() - zmin) < tol: faces.append("zmin")
-    if abs(pnt.Z() - zmax) < tol: faces.append("zmax")
-    return faces
-
-def project_point_to_bbox(loc, dir, bounds):
-    """
-    Projeta o ponto central 'loc' ao longo da direção 'dir' até tocar no bounding box 'bounds'.
-    Retorna o ponto na face mais próxima.
-    """
-    px, py, pz = loc.X(), loc.Y(), loc.Z()
-    dx, dy, dz = dir.X(), dir.Y(), dir.Z()
-    # Protege contra direção nula
-    if abs(dx) < 1e-8: dx = 1e-8
-    if abs(dy) < 1e-8: dy = 1e-8
-    if abs(dz) < 1e-8: dz = 1e-8
-
-    t_values = []
-    for i, (min_b, max_b, p, d) in enumerate(zip(bounds[:3], bounds[3:], [px, py, pz], [dx, dy, dz])):
-        t1 = (min_b - p) / d
-        t2 = (max_b - p) / d
-        t_values.extend([t1, t2])
-    t_values = [t for t in t_values if t > 0]
-    if not t_values:
-        return loc
-    t = min(t_values)
-    return gp_Pnt(px + t*dx, py + t*dy, pz + t*dz)
+# Função para identificar se o furo atravessa a peça
 
 def is_hole_through(faces, shape, tol=2.0):
     if not shape or shape.IsNull():
@@ -107,18 +72,128 @@ def is_hole_through(faces, shape, tol=2.0):
             return True
     return False
 
+# === utils para main_details.py ===
+
+def extract_from_filename(filepath):
+    base = os.path.basename(filepath)
+    name, _ = os.path.splitext(base)
+    parts = re.split(r"[_\-]", name)
+    if len(parts) >= 2:
+        return parts[-2], parts[-1]
+    return None, None
+
+def extract_mold_and_part_from_step(filepath):
+    file_mold, file_part = extract_from_filename(filepath)
+    if file_mold and file_part:
+        return file_mold, file_part
+
+    mold, part = None, None
+    product_mold, product_part = None, None
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if "FILE_NAME" in line and (mold is None or part is None):
+                match = re.search(r"FILE_NAME\('([^']+)'", line)
+                if match:
+                    filename = match.group(1)
+                    base = os.path.basename(filename)
+                    name, _ = os.path.splitext(base)
+                    parts = re.split(r"[_\-]", name)
+                    if len(parts) >= 2:
+                        mold = parts[-2]
+                        part = parts[-1]
+            if "PRODUCT('" in line and (product_mold is None or product_part is None):
+                match = re.search(r"PRODUCT\('([^']+)'", line)
+                if match:
+                    pname = match.group(1)
+                    parts = re.split(r"[_\-]", pname)
+                    if len(parts) >= 2:
+                        product_mold = parts[-2]
+                        product_part = parts[-1]
+
+    if mold and part:
+        return mold, part
+    elif product_mold and product_part:
+        return product_mold, product_part
+    return None, None
+
+def detect_positions_from_holes(axis_groups, shape):
+    bbox = Bnd_Box()
+    brepbndlib.Add(shape, bbox)
+    bounds = bbox.Get()
+    zmin, zmax = bounds[2], bounds[5]
+    thickness = zmax - zmin
+
+    has_cone_up = False
+    has_cone_down = False
+    deep_blind_hole = False
+
+    for faces in axis_groups:
+        if is_hole_through(faces, shape):
+            continue
+
+        for stype, face, adaptor in faces:
+            if stype == GeomAbs_Cone:
+                dir_z = adaptor.Cone().Axis().Direction().Z()
+                if dir_z > 0.5:
+                    has_cone_up = True
+                elif dir_z < -0.5:
+                    has_cone_down = True
+            elif stype == GeomAbs_Cylinder:
+                face_bbox = Bnd_Box()
+                brepbndlib.Add(face, face_bbox)
+                _, _, fzmin, _, _, fzmax = face_bbox.Get()
+                depth = abs(fzmax - fzmin)
+                if depth > 0.9 * thickness:
+                    deep_blind_hole = True
+
+    if (has_cone_up and has_cone_down) or (deep_blind_hole and (has_cone_up or has_cone_down)):
+        return 2
+    if has_cone_up or has_cone_down or deep_blind_hole:
+        return 2
+    return 1
+
+# === utils para cylindrical_details.py ===
+
+def group_faces_by_axis(shape):
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    axis_groups = defaultdict(list)
+    while explorer.More():
+        face = explorer.Current()
+        surface = BRep_Tool.Surface(face)
+        adaptor = GeomAdaptor_Surface(surface)
+        surface_type = adaptor.GetType()
+        if surface_type == GeomAbs_Cylinder:
+            key = axis_key(adaptor)
+            axis_groups[key].append((surface_type, face, adaptor))
+        explorer.Next()
+    return list(axis_groups.values())
+
+def get_min_max_cylindrical_diameter(shape):
+    min_d = None
+    max_d = None
+    axis_groups = group_faces_by_axis(shape)
+    for faces in axis_groups:
+        only_cylinders = all(stype == GeomAbs_Cylinder for stype, _, _ in faces)
+        if only_cylinders:
+            for stype, face, adaptor in faces:
+                d = adaptor.Cylinder().Radius() * 2
+                if (min_d is None) or (d < min_d):
+                    min_d = d
+                if (max_d is None) or (d > max_d):
+                    max_d = d
+    if min_d is not None and max_d is not None:
+        return round(min_d, 2), round(max_d, 2)
+    else:
+        return None, None
+
 def get_group_diameters(faces):
     diams = []
     for surface_type, face, adaptor in faces:
         if surface_type == GeomAbs_Cylinder:
             diams.append(round(adaptor.Cylinder().Radius() * 2, 2))
         elif surface_type == GeomAbs_Cone:
-            # Podes usar o raio de referência ou calcular ambos os extremos
             base = round(adaptor.Cone().RefRadius() * 2, 2)
-            semi_angle = adaptor.Cone().SemiAngle()
-            # Se quiseres, calcula o maior diâmetro do cone pelas extremidades (opcional)
             diams.append(base)
-        # outros tipos ignorados
     if not diams:
         return None, None
     return min(diams), max(diams)
@@ -138,72 +213,57 @@ def classify_hole_group_type(faces):
         return "misto"
     else:
         return "desconhecido"
-    
-def detect_positions(shape):
-    """
-    Deteta se é preciso virar a peça (1 ou 2 posições) com base nos furos cónicos não passantes.
-    """
-    from .cylindrical_details import group_faces_by_axis
-    from OCC.Core.GeomAbs import GeomAbs_Cone, GeomAbs_Cylinder
 
-    axis_groups = group_faces_by_axis(shape)
-    orientations = []
+# === utils para rectangular_details.py ===
 
-    for faces in axis_groups:
-        has_cone = any(stype == GeomAbs_Cone for stype, _, _ in faces)
-        # Só analisar furos que têm cone (cabeça de embutir)
-        if has_cone:
-            for stype, face, adaptor in faces:
-                if stype == GeomAbs_Cone:
-                    axis = adaptor.Cone().Axis()
-                    dir_z = axis.Direction().Z()
-                    # Marca como para cima (+Z) ou para baixo (-Z)
-                    if dir_z > 0.5:
-                        orientations.append('up')
-                    elif dir_z < -0.5:
-                        orientations.append('down')
-    # Se existir 'up' e 'down', são necessárias 2 posições
-    if 'up' in orientations and 'down' in orientations:
-        return 2
-    # Só uma orientação -> 1 posição
-    return 1
-
-def group_faces_by_axis(shape):
-    """
-    Agrupa todas as faces cilíndricas pelo eixo.
-    """
+def group_rectangular_faces(shape):
     explorer = TopExp_Explorer(shape, TopAbs_FACE)
-    axis_groups = defaultdict(list)
+    rectangles = []
     while explorer.More():
         face = explorer.Current()
-        surface = BRep_Tool.Surface(face)
-        adaptor = GeomAdaptor_Surface(surface)
-        surface_type = adaptor.GetType()
-        if surface_type == GeomAbs_Cylinder:
-            key = axis_key(adaptor)
-            axis_groups[key].append((surface_type, face, adaptor))
+        adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
+        if adaptor.GetType() == GeomAbs_Plane:
+            rectangles.append(face)
         explorer.Next()
-    return list(axis_groups.values())
+    return rectangles
 
-def get_min_max_cylindrical_diameter(shape):
-    """
-    Calcula o diâmetro mínimo e máximo entre todos os furos cilíndricos da peça.
-    """
-    from OCC.Core.GeomAbs import GeomAbs_Cylinder
-    min_d = None
-    max_d = None
-    axis_groups = group_faces_by_axis(shape)
-    for faces in axis_groups:
-        only_cylinders = all(stype == GeomAbs_Cylinder for stype, _, _ in faces)
-        if only_cylinders:
-            # Considera todos os cilindros no grupo
-            for stype, face, adaptor in faces:
-                d = adaptor.Cylinder().Radius() * 2
-                if (min_d is None) or (d < min_d):
-                    min_d = d
-                if (max_d is None) or (d > max_d):
-                    max_d = d
-    if min_d is not None and max_d is not None:
-        return round(min_d, 2), round(max_d, 2)
-    else:
-        return None, None
+# === utils auxiliares (usados em várias partes) ===
+
+def get_all_vertices_of_group(faces):
+    vertices = []
+    for face in faces:
+        explorer = TopExp_Explorer(face, TopAbs_VERTEX)
+        while explorer.More():
+            v = explorer.Current()
+            vertices.append(BRep_Tool.Pnt(v))
+            explorer.Next()
+    return vertices
+
+def get_bbox_faces_touched(pnt, bbox, tol=0.5):
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox
+    faces = []
+    if abs(pnt.X() - xmin) < tol: faces.append("xmin")
+    if abs(pnt.X() - xmax) < tol: faces.append("xmax")
+    if abs(pnt.Y() - ymin) < tol: faces.append("ymin")
+    if abs(pnt.Y() - ymax) < tol: faces.append("ymax")
+    if abs(pnt.Z() - zmin) < tol: faces.append("zmin")
+    if abs(pnt.Z() - zmax) < tol: faces.append("zmax")
+    return faces
+
+def project_point_to_bbox(loc, dir, bounds):
+    px, py, pz = loc.X(), loc.Y(), loc.Z()
+    dx, dy, dz = dir.X(), dir.Y(), dir.Z()
+    if abs(dx) < 1e-8: dx = 1e-8
+    if abs(dy) < 1e-8: dy = 1e-8
+    if abs(dz) < 1e-8: dz = 1e-8
+
+    t_values = []
+    for i, (min_b, max_b, p, d) in enumerate(zip(bounds[:3], bounds[3:], [px, py, pz], [dx, dy, dz])):
+        t1 = (min_b - p) / d
+        t2 = (max_b - p) / d
+        t_values.extend([t1, t2])
+    t_values = [t for t in t_values if t > 0]
+    if not t_values:
+        return loc
+    t = min(t_values)
+    return gp_Pnt(px + t*dx, py + t*dy, pz + t*dz)
