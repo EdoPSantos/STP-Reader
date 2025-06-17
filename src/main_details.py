@@ -6,7 +6,7 @@ from OCC.Core.TopAbs import TopAbs_FACE
 from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepBndLib import brepbndlib
 from collections import defaultdict
-from .utils import extract_from_filename, extract_mold_and_part_from_step, detect_positions_from_holes, group_faces_by_axis
+from .utils import extract_mold_and_part_from_step, detect_positions_from_holes, group_faces_by_axis_and_proximity, get_auto_loc_tol
 
 import os
 import re
@@ -29,10 +29,11 @@ def show_general_summary(shape, filepath=None):
     length = abs(xmax - xmin)
     width = abs(ymax - ymin)
 
-    axis_groups = group_faces_by_axis(shape)
+    loc_tol = get_auto_loc_tol(shape)
+    axis_groups = group_faces_by_axis_and_proximity(shape, loc_tol=loc_tol)
     count_cylindrical = len(axis_groups)
 
-    diameters = []
+    diameters = []  # Lista de tuplos: (min_diameter, max_diameter)
     for faces in axis_groups:
         radii = []
         for stype, face, adaptor in faces:
@@ -40,8 +41,17 @@ def show_general_summary(shape, filepath=None):
                 r = adaptor.Cylinder().Radius()
                 if r > 0:
                     radii.append(round(r * 2, 2))
+            elif stype == GeomAbs_Cone:
+                base_r = adaptor.Cone().RefRadius()
+                if base_r > 0:
+                    radii.append(round(base_r * 2, 2))
         if radii:
-            diameters.append(max(radii))
+            min_d = min(radii)
+            max_d = max(radii)
+            diameters.append((min_d, max_d))
+
+    from collections import Counter
+    counter = Counter(diameters)
 
     count_rectangular = 0
 
@@ -52,8 +62,8 @@ def show_general_summary(shape, filepath=None):
     print("=" * 40)
     print(f"Molde: {mold_name}")
     print(f"Peça: {part_name}")
-    print(f"Largura: {width:.0f} mm")
-    print(f"Comprimento: {length:.0f} mm")
+    print(f"Largura: {length:.0f} mm")
+    print(f"Comprimento: {width:.0f} mm")
     print(f"Posições: {positions}")
     print(f"Qtd. furos cilíndricos: {count_cylindrical}")
     print(f"Qtd. furos quadrados: {count_rectangular}")
@@ -61,9 +71,11 @@ def show_general_summary(shape, filepath=None):
 
     if diameters:
         print("Diâmetro dos furos cilíndricos:")
-        counter = Counter(diameters)
-        for diameter, count in sorted(counter.items(), key=lambda x: -x[0]):
-            print(f"  Tem {count} furo(s) com {diameter} mm")
+        for (min_d, max_d), count in sorted(counter.items(), key=lambda x: -x[0][1]):  # Ordena pelo diâmetro máximo decrescente
+            if min_d == max_d:
+                print(f"  Tem {count} furo(s) com {min_d} mm de diâmetro")
+            else:
+                print(f"  Tem {count} furo(s) de {min_d} mm a {max_d} mm de diâmetro")
     else:
         print("Diâmetro dos furos cilíndricos: -")
 

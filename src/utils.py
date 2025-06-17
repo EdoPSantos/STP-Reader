@@ -1,21 +1,35 @@
 # === Funções Globais (usadas por múltiplos ficheiros) ===
 
+# === Módulos padrão ===
 import os
 import re
+import math
 from collections import defaultdict
+
+# === OCC / pythonocc-core ===
+from OCC.Core.gp import gp_Pnt
+from OCC.Core.Bnd import Bnd_Box
+from OCC.Core.BRep import BRep_Tool
+from OCC.Core.BRepBndLib import brepbndlib
 
 from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Plane
 from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
-from OCC.Core.gp import gp_Pnt
-from OCC.Core.Bnd import Bnd_Box
-from OCC.Core.BRepBndLib import brepbndlib
-from OCC.Core.BRep import BRep_Tool
-from OCC.Core.TopExp import TopExp_Explorer
+
 from OCC.Core.TopAbs import TopAbs_VERTEX, TopAbs_FACE
+from OCC.Core.TopExp import TopExp_Explorer
+
+from OCC.Core.TopoDS import TopoDS_Shape, TopoDS_Face, topods
+from OCC.Core.TopTools import TopTools_IndexedMapOfShape
 
 # Utilitário para gerar chave de agrupamento de furos por eixo
 
-def axis_key(adaptor):
+def axis_key(adaptor, loc_tol=0.2, dir_tol=0.02):
+    """
+    Gera uma chave de agrupamento baseada no centro (location) e direção (direction) do eixo,
+    ambos arredondados para permitir pequenas variações (tolerância).
+    - loc_tol: tolerância para a localização do centro (em mm)
+    - dir_tol: tolerância para a direção do eixo (unitário)
+    """
     surface_type = adaptor.GetType()
     if surface_type == GeomAbs_Cylinder:
         axis = adaptor.Cylinder().Axis()
@@ -25,50 +39,40 @@ def axis_key(adaptor):
         raise ValueError("Tipo de superfície não suportado em axis_key")
     loc = axis.Location()
     dir = axis.Direction()
+    # Arredonda para tolerância especificada
     return (
-        round(loc.X(), 2), round(loc.Y(), 2), round(loc.Z(), 2),
-        round(dir.X(), 3), round(dir.Y(), 3), round(dir.Z(), 3)
+        round(loc.X() / loc_tol) * loc_tol,
+        round(loc.Y() / loc_tol) * loc_tol,
+        round(loc.Z() / loc_tol) * loc_tol,
+        round(dir.X() / dir_tol) * dir_tol,
+        round(dir.Y() / dir_tol) * dir_tol,
+        round(dir.Z() / dir_tol) * dir_tol,
     )
 
 # Função para identificar se o furo atravessa a peça
-
 def is_hole_through(faces, shape, tol=2.0):
+    """
+    Verifica se pelo menos um vértice de qualquer face do grupo toca uma face extrema do bounding box,
+    E pelo menos um vértice toca a outra face extrema (ou seja, o furo é passante).
+    """
     if not shape or shape.IsNull():
         raise ValueError("Shape inválido recebido em is_hole_through.")
     bbox = Bnd_Box()
     brepbndlib.Add(shape, bbox)
     bounds = bbox.Get()
-    hit_faces = set()
-    for surface_type, face, adaptor in faces:
+    faces_touched = set()
+
+    for _, face, _ in faces:
         vertex_explorer = TopExp_Explorer(face, TopAbs_VERTEX)
         while vertex_explorer.More():
             vertex = vertex_explorer.Current()
             pnt = BRep_Tool.Pnt(vertex)
             touched = get_bbox_faces_touched(pnt, bounds, tol)
-            hit_faces.update(touched)
+            faces_touched.update(touched)
             vertex_explorer.Next()
-    if faces:
-        surface_type, face, adaptor = faces[0]
-        if surface_type == GeomAbs_Cylinder:
-            axis = adaptor.Cylinder().Axis()
-        elif surface_type == GeomAbs_Cone:
-            axis = adaptor.Cone().Axis()
-        else:
-            axis = None
-        if axis:
-            loc = axis.Location()
-            dir = axis.Direction()
-            for k in range(-3, 4):
-                t = k * 0.25
-                px = loc.X() + dir.X() * t * (bounds[3] - bounds[0])
-                py = loc.Y() + dir.Y() * t * (bounds[4] - bounds[1])
-                pz = loc.Z() + dir.Z() * t * (bounds[5] - bounds[2])
-                pnt = gp_Pnt(px, py, pz)
-                touched = get_bbox_faces_touched(pnt, bounds, tol)
-                hit_faces.update(touched)
     axis_pairs = [('xmin','xmax'), ('ymin','ymax'), ('zmin','zmax')]
     for a, b in axis_pairs:
-        if a in hit_faces and b in hit_faces:
+        if a in faces_touched and b in faces_touched:
             return True
     return False
 
@@ -216,16 +220,56 @@ def classify_hole_group_type(faces):
 
 # === utils para rectangular_details.py ===
 
-def group_rectangular_faces(shape):
+def group_connected_planar_faces(shape):
+    """
+    Retorna uma lista de todas as faces planas como grupos individuais.
+    """
+    groups = []
+
     explorer = TopExp_Explorer(shape, TopAbs_FACE)
-    rectangles = []
     while explorer.More():
-        face = explorer.Current()
+        face = topods.Face(explorer.Current())
         adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
         if adaptor.GetType() == GeomAbs_Plane:
-            rectangles.append(face)
+            groups.append(face)
         explorer.Next()
-    return rectangles
+    return groups
+
+def classify_rectangular_face(face, tol=1.0):
+    if not isinstance(face, TopoDS_Face):
+        try:
+            face = topods.Face(face)
+        except Exception as e:
+            raise ValueError("Não foi possível converter a face para TopoDS_Face") from e
+
+    bbox = Bnd_Box()
+    brepbndlib.Add(face, bbox)
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+
+    dx = abs(xmax - xmin)
+    dy = abs(ymax - ymin)
+    dz = abs(zmax - zmin)
+
+    sides = sorted([dx, dy, dz])
+    largura, comprimento = round(sides[0], 2), round(sides[1], 2)
+
+    tipo = "quadrado" if abs(largura - comprimento) <= tol else "retangular"
+    return tipo, max(largura, comprimento), min(largura, comprimento)
+
+def get_piece_dimensions(shape):
+    """
+    Calcula o comprimento e largura máximos da peça (bounding box global).
+    Retorna (comprimento, largura).
+    """
+    bbox = Bnd_Box()
+    brepbndlib.Add(shape, bbox)
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+    dx = abs(xmax - xmin)
+    dy = abs(ymax - ymin)
+    # No caso de peças planas, o maior valor é comprimento, o menor é largura
+    comprimento = round(max(dx, dy), 2)
+    largura = round(min(dx, dy), 2)
+    return comprimento, largura
 
 # === utils auxiliares (usados em várias partes) ===
 
@@ -267,3 +311,75 @@ def project_point_to_bbox(loc, dir, bounds):
         return loc
     t = min(t_values)
     return gp_Pnt(px + t*dx, py + t*dy, pz + t*dz)
+
+def group_faces_by_axis_and_proximity(shape, loc_tol=2.0, dir_tol=0.05):
+    """
+    Agrupa faces cilíndricas e cónicas por eixo (direção) e centro (location) com tolerância.
+    Furos mistos (cilindro+cone) que estejam colineares e com centro próximo ficam no mesmo grupo.
+    """
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    temp_groups = []
+
+    while explorer.More():
+        face = explorer.Current()
+        surface = BRep_Tool.Surface(face)
+        adaptor = GeomAdaptor_Surface(surface)
+        stype = adaptor.GetType()
+        if stype not in (GeomAbs_Cylinder, GeomAbs_Cone):
+            explorer.Next()
+            continue
+
+        # Obter centro e direção
+        if stype == GeomAbs_Cylinder:
+            axis = adaptor.Cylinder().Axis()
+        elif stype == GeomAbs_Cone:
+            axis = adaptor.Cone().Axis()
+        loc = axis.Location()
+        dir = axis.Direction()
+        temp_groups.append({
+            'loc': (loc.X(), loc.Y(), loc.Z()),
+            'dir': (dir.X(), dir.Y(), dir.Z()),
+            'stype': stype,
+            'face': face,
+            'adaptor': adaptor
+        })
+        explorer.Next()
+
+    # Função de comparação de direção com tolerância (produto escalar)
+    def is_dir_close(d1, d2, tol=dir_tol):
+        dot = sum(a * b for a, b in zip(d1, d2))
+        return abs(abs(dot) - 1.0) < tol
+
+    # Agrupamento
+    groups = []
+    used = [False] * len(temp_groups)
+
+    for i, g in enumerate(temp_groups):
+        if used[i]:
+            continue
+        group = [g]
+        used[i] = True
+        for j, h in enumerate(temp_groups):
+            if used[j]:
+                continue
+            # Mesma direção e centro suficientemente próximos
+            if is_dir_close(g['dir'], h['dir'], dir_tol):
+                dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(g['loc'], h['loc'])))
+                if dist < loc_tol:
+                    group.append(h)
+                    used[j] = True
+        groups.append([(item['stype'], item['face'], item['adaptor']) for item in group])
+    return groups
+
+def get_auto_loc_tol(shape):
+    bbox = Bnd_Box()
+    brepbndlib.Add(shape, bbox)
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+    max_dim = max(abs(xmax - xmin), abs(ymax - ymin), abs(zmax - zmin))
+    # Ajusta conforme os teus requisitos e experiência
+    if max_dim < 200:
+        return 2.0
+    elif max_dim < 500:
+        return 5.0
+    else:
+        return 10.0
