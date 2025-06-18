@@ -8,7 +8,7 @@ import numpy as np
 from collections import defaultdict
 
 # === OCC / pythonocc-core ===
-from OCC.Core.gp import gp_Pnt
+from OCC.Core.gp import gp_Pnt, gp_Vec, gp_Dir
 from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.BRepBndLib import brepbndlib
@@ -335,6 +335,129 @@ def auto_filter_rectangular_faces(faces, width_min_abs=0.5, width_percentile=20)
     # Só aceita as larguras acima do percentil
     final = [t for t in filtered if t[3] > threshold]
     return final
+
+# Funções Utilitárias Adaptadas
+
+def get_cylindrical_faces(shape, min_radius=2.0, max_radius=30.0):
+    """
+    Retorna todas as faces cilíndricas no shape dentro do intervalo de raio.
+    """
+    faces = []
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    while explorer.More():
+        face = topods.Face(explorer.Current())
+        adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
+        if adaptor.GetType() == GeomAbs_Cylinder:
+            cyl = adaptor.Cylinder()
+            radius = cyl.Radius()
+            if min_radius <= radius <= max_radius:
+                faces.append((face, cyl))
+        explorer.Next()
+    return faces
+
+def are_cylinders_parallel(cyl1, cyl2, angle_tol=0.05):
+    """
+    Verifica se os eixos de dois cilindros são paralelos.
+    """
+    dir1 = cyl1.Axis().Direction()
+    dir2 = cyl2.Axis().Direction()
+    dot = dir1.Dot(dir2)
+    # Ângulo próximo de 0° ou 180°
+    return abs(abs(dot) - 1.0) < angle_tol
+
+def distance_between_axes(cyl1, cyl2, tol=1e-7):
+    p1 = cyl1.Axis().Location()
+    d1 = cyl1.Axis().Direction()
+    p2 = cyl2.Axis().Location()
+    d2 = cyl2.Axis().Direction()
+    v = gp_Vec(p1, p2)
+    dot = abs(d1.Dot(d2))
+    if abs(dot - 1.0) < tol:
+        # Eixos paralelos: distância perpendicular
+        return v.Crossed(gp_Vec(d1)).Magnitude() / gp_Vec(d1).Magnitude()
+
+    # Só aqui faz Crossed (não paralelos)
+    n = d1.Crossed(d2)
+    normalized_n = gp_Vec(n.XYZ().Normalized())
+    return abs(v.Dot(normalized_n))
+
+def get_face_area(face):
+    """
+    Retorna a área de uma face.
+    """
+    props = GProp_GProps()
+    brepgprop.SurfaceProperties(face, props)
+    return props.Mass()
+
+# Função principal de slots
+
+def find_slots(shape):
+    """
+    Procura grupos de 2 cilindros paralelos + faces planas laterais (slots).
+    Retorna lista de slots: (comprimento, largura, centro, orientação).
+    """
+    cylindrical_faces = get_cylindrical_faces(shape)
+    slots = []
+    # Testa todos os pares de cilindros paralelos com mesmo raio
+    for i, (face1, cyl1) in enumerate(cylindrical_faces):
+        for j, (face2, cyl2) in enumerate(cylindrical_faces):
+            if i >= j:
+                continue
+            if abs(cyl1.Radius() - cyl2.Radius()) > 0.5:
+                continue
+            if not are_cylinders_parallel(cyl1, cyl2):
+                continue
+            dist = distance_between_axes(cyl1, cyl2)
+            # Só considera slots plausíveis (distância realista entre eixos)
+            if dist < 10.0 or dist > 2000.0: # ajusta para o teu caso
+                continue
+            largura = round(2 * cyl1.Radius(), 2)
+            comprimento = round(dist + 2 * cyl1.Radius(), 2)
+            # Opcional: verifica se há faces planas paralelas com estas dimensões entre os cilindros
+            slots.append((comprimento, largura))
+    return slots
+
+def get_bbox(shape_or_face):
+    """
+    Retorna a bounding box de uma shape ou face: (xmin, ymin, zmin, xmax, ymax, zmax)
+    """
+    from OCC.Core.Bnd import Bnd_Box
+    from OCC.Core.BRepBndLib import brepbndlib
+
+    bbox = Bnd_Box()
+    brepbndlib.Add(shape_or_face, bbox)
+    return bbox.Get()
+
+def is_open_edge(face, piece_bbox, tol=2.0):
+    """
+    Verifica se pelo menos um lado da face coincide com um dos limites globais da peça.
+    Considera 'slot aberto' se apenas UM lado tocar a borda da peça.
+    """
+    xmin_p, ymin_p, zmin_p, xmax_p, ymax_p, zmax_p = piece_bbox
+    xmin, ymin, zmin, xmax, ymax, zmax = get_bbox(face)
+    hits = [
+        abs(xmin - xmin_p) < tol,
+        abs(xmax - xmax_p) < tol,
+        abs(ymin - ymin_p) < tol,
+        abs(ymax - ymax_p) < tol,
+    ]
+    return sum(hits) == 1
+
+# === teste para visualizar todos os retangulos ===
+
+def group_all_planar_faces(shape):
+    """
+    Retorna uma lista de todas as faces planas da chapa.
+    """
+    faces = []
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    while explorer.More():
+        face = topods.Face(explorer.Current())
+        adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
+        if adaptor.GetType() == GeomAbs_Plane:
+            faces.append(face)
+        explorer.Next()
+    return faces
 
 # === utils auxiliares (usados em várias partes) ===
 
