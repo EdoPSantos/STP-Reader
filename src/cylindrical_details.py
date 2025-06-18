@@ -82,9 +82,9 @@ def get_circular_hole_diameters_by_type(shape):
 
     
     # --- BLOCO DE DEBUG ---
-    for i, group in enumerate(hole_groups):
-        print(f"Grupo {i}: {len(group)} faces")
-        print("Tipos:", [classify_hole_group_type([face]) for face in group])
+    #for i, group in enumerate(hole_groups):
+    #    print(f"Grupo {i}: {len(group)} faces")
+    #    print("Tipos:", [classify_hole_group_type([face]) for face in group])
     # -----------------------
 
     diameters_through = []

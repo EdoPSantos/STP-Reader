@@ -4,6 +4,7 @@
 import os
 import re
 import math
+import numpy as np
 from collections import defaultdict
 
 # === OCC / pythonocc-core ===
@@ -18,8 +19,12 @@ from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
 from OCC.Core.TopAbs import TopAbs_VERTEX, TopAbs_FACE
 from OCC.Core.TopExp import TopExp_Explorer
 
-from OCC.Core.TopoDS import TopoDS_Shape, TopoDS_Face, topods
+from OCC.Core.TopoDS import TopoDS_Shape, topods, TopoDS_Face, TopoDS_Wire, TopoDS_Vertex
 from OCC.Core.TopTools import TopTools_IndexedMapOfShape
+
+from OCC.Core.BRepGProp import brepgprop
+from OCC.Core.BRepTools import breptools
+from OCC.Core.GProp import GProp_GProps
 
 # Utilitário para gerar chave de agrupamento de furos por eixo
 
@@ -220,56 +225,116 @@ def classify_hole_group_type(faces):
 
 # === utils para rectangular_details.py ===
 
-def group_connected_planar_faces(shape):
-    """
-    Retorna uma lista de todas as faces planas como grupos individuais.
-    """
-    groups = []
+def get_face_area(face):
+    """Retorna a área de uma face."""
+    props = GProp_GProps()
+    brepgprop.SurfaceProperties(face, props)  # <-- método correto e sem warning
+    return props.Mass()
 
+def is_circular_face(face, tol=0.5):
+    """
+    Verifica se uma face plana é circular.
+    """
+    outer_wire = breptools.OuterWire(face)
+    vertex_explorer = TopExp_Explorer(outer_wire, TopAbs_VERTEX)
+    vertices = []
+    while vertex_explorer.More():
+        vertex = topods.Vertex(vertex_explorer.Current())
+        pnt = BRep_Tool.Pnt(vertex)
+        vertices.append((pnt.X(), pnt.Y(), pnt.Z()))
+        vertex_explorer.Next()
+    if len(vertices) < 5:
+        return False
+    cx = sum(v[0] for v in vertices) / len(vertices)
+    cy = sum(v[1] for v in vertices) / len(vertices)
+    cz = sum(v[2] for v in vertices) / len(vertices)
+    radii = [math.sqrt((v[0] - cx) ** 2 + (v[1] - cy) ** 2 + (v[2] - cz) ** 2) for v in vertices]
+    avg_radius = sum(radii) / len(radii)
+    if all(abs(r - avg_radius) < tol for r in radii):
+        return True
+    return False
+
+def group_non_circular_planar_faces(shape):
+    """
+    Retorna todas as faces planas não circulares, excluindo a maior (face exterior).
+    """
+    faces = []
     explorer = TopExp_Explorer(shape, TopAbs_FACE)
     while explorer.More():
         face = topods.Face(explorer.Current())
         adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
         if adaptor.GetType() == GeomAbs_Plane:
-            groups.append(face)
+            if not is_circular_face(face):
+                faces.append(face)
         explorer.Next()
-    return groups
+    faces_with_area = [(face, get_face_area(face)) for face in faces]
+    if not faces_with_area:
+        return []
+    # Remove as faces exteriores (maiores áreas)
+    faces_with_area.sort(key=lambda x: x[1], reverse=True)
+    max_area = faces_with_area[0][1]
+    area_tol = 1.0
+    filtered_faces = [f for f, a in faces_with_area if abs(a - max_area) > area_tol]
+    return filtered_faces
 
 def classify_rectangular_face(face, tol=1.0):
+    """
+    Classifica uma face plana não circular como quadrada ou retangular, devolvendo as medidas principais.
+    """
     if not isinstance(face, TopoDS_Face):
         try:
             face = topods.Face(face)
         except Exception as e:
-            raise ValueError("Não foi possível converter a face para TopoDS_Face") from e
-
+            raise ValueError("Could not convert face to TopoDS_Face") from e
     bbox = Bnd_Box()
     brepbndlib.Add(face, bbox)
     xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-
     dx = abs(xmax - xmin)
     dy = abs(ymax - ymin)
     dz = abs(zmax - zmin)
-
-    sides = sorted([dx, dy, dz])
-    largura, comprimento = round(sides[0], 2), round(sides[1], 2)
-
-    tipo = "quadrado" if abs(largura - comprimento) <= tol else "retangular"
-    return tipo, max(largura, comprimento), min(largura, comprimento)
+    sides = sorted([dx, dy, dz], reverse=True)
+    length, width = round(sides[0], 2), round(sides[1], 2)
+    shape_type = "square" if abs(width - length) <= tol else "rectangular"
+    return shape_type, length, width
 
 def get_piece_dimensions(shape):
     """
     Calcula o comprimento e largura máximos da peça (bounding box global).
-    Retorna (comprimento, largura).
+    Retorna (length, width).
     """
     bbox = Bnd_Box()
     brepbndlib.Add(shape, bbox)
     xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
     dx = abs(xmax - xmin)
     dy = abs(ymax - ymin)
-    # No caso de peças planas, o maior valor é comprimento, o menor é largura
-    comprimento = round(max(dx, dy), 2)
-    largura = round(min(dx, dy), 2)
-    return comprimento, largura
+    # O maior valor é length, o menor é width (universal, sem assumir eixos)
+    length = round(max(dx, dy), 2)
+    width = round(min(dx, dy), 2)
+    return length, width
+
+def auto_filter_rectangular_faces(faces, width_min_abs=0.5, width_percentile=20):
+    """
+    Recebe lista de faces não circulares, remove as com largura quase nula
+    e retorna apenas as 'verdadeiras' baseando-se no percentil das larguras.
+    """
+    # Extrai todas as larguras e classificações
+    measures = []
+    for face in faces:
+        shape_type, length, width = classify_rectangular_face(face)
+        measures.append((face, shape_type, length, width))
+
+    # Filtra larguras quase nulas (degraus/chanfros)
+    filtered = [t for t in measures if t[3] > width_min_abs]
+    if not filtered:
+        return []
+
+    # Extrai só as larguras válidas
+    all_widths = [t[3] for t in filtered]
+    # Calcula o valor do percentil (por ex: elimina os 20% mais pequenos)
+    threshold = np.percentile(all_widths, width_percentile)
+    # Só aceita as larguras acima do percentil
+    final = [t for t in filtered if t[3] > threshold]
+    return final
 
 # === utils auxiliares (usados em várias partes) ===
 
