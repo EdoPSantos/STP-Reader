@@ -222,6 +222,193 @@ def classify_hole_group_type(faces):
         return "misto"
     else:
         return "desconhecido"
+    
+def get_circular_hole_diameters_by_type(shape):
+    """
+    Devolve uma lista [(min_d, max_d, tipo), ...] para furos passantes e fechados.
+    Cada grupo representa 1 furo real (pode ser misto cone/cilindro/cilindro+cone+cilindro).
+    """
+
+    loc_tol = get_auto_loc_tol(shape)
+    hole_groups = group_faces_by_axis_and_proximity(shape, loc_tol=loc_tol)
+
+    
+    # --- BLOCO DE DEBUG ---
+    #for i, group in enumerate(hole_groups):
+    #    print(f"Grupo {i}: {len(group)} faces")
+    #    print("Tipos:", [classify_hole_group_type([face]) for face in group])
+    # -----------------------
+
+    diameters_through = []
+    diameters_closed = []
+
+    for faces in hole_groups:
+        radii, _ = get_all_radii_of_group(faces)
+        if not radii:
+            continue
+        min_d = round(min(radii) * 2, 2)
+        max_d = round(max(radii) * 2, 2)
+        tipo = classify_hole_group_type(faces)
+        result = is_hole_through(faces, shape)
+        data = (min_d, max_d, tipo)
+        if result:
+            diameters_through.append(data)
+        else:
+            diameters_closed.append(data)
+    return diameters_through, diameters_closed
+
+def get_all_radii_of_group(faces, min_allowed=3.0):
+    """
+    Retorna todos os raios (em mm) de todas as faces do grupo.
+    Para cones, calcula sempre o raio nos dois extremos da face (base e topo).
+    """
+    import math
+    from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone
+
+    radii = []
+    has_cone = False
+    for stype, face, adaptor in faces:
+        if stype == GeomAbs_Cylinder:
+            r = adaptor.Cylinder().Radius()
+            if r >= min_allowed:
+                radii.append(r)
+        elif stype == GeomAbs_Cone:
+            has_cone = True
+            cone = adaptor.Cone()
+            ref_radius = cone.RefRadius()
+            semi_angle = cone.SemiAngle()
+            axis = cone.Axis()
+            axis_loc = axis.Location()
+            axis_dir = axis.Direction()
+            zs = []
+            for pnt in get_all_vertices_of_group([face]):
+                v = pnt.XYZ() - axis_loc.XYZ()
+                z_rel = v.Dot(axis_dir.XYZ())
+                zs.append(z_rel)
+            if zs:
+                z_min = min(zs)
+                z_max = max(zs)
+                r_min = abs(ref_radius + z_min * math.tan(semi_angle))
+                r_max = abs(ref_radius + z_max * math.tan(semi_angle))
+                if r_min >= min_allowed:
+                    radii.append(r_min)
+                if r_max >= min_allowed:
+                    radii.append(r_max)
+            else:
+                for dz in [-10, 10]:
+                    radius = abs(ref_radius + dz * math.tan(semi_angle))
+                    if radius >= min_allowed:
+                        radii.append(radius)
+    radii = sorted(set(round(r, 2) for r in radii))
+    return radii, has_cone
+
+def is_face_circular_complete(face, tol=0.05):
+    """
+    Verifica se uma face cilíndrica/plana circular é uma circunferência completa ou um arco/parcial.
+    Retorna True se for completa, False se for parcial.
+    - tol: tolerância relativa (ex: 0.05 == 5%)
+    """
+    from OCC.Core.BRepTools import breptools
+    from OCC.Core.TopExp import TopExp_Explorer
+    from OCC.Core.TopAbs import TopAbs_VERTEX, TopAbs_EDGE
+    from OCC.Core.BRep import BRep_Tool
+    import math
+
+    outer_wire = breptools.OuterWire(face)
+    edge_explorer = TopExp_Explorer(outer_wire, TopAbs_EDGE)
+    edge_lengths = []
+    while edge_explorer.More():
+        edge = edge_explorer.Current()
+        curve_handle, first, last = BRep_Tool.Curve(edge)
+        length = abs(last - first)
+        edge_lengths.append(length)
+        edge_explorer.Next()
+    if not edge_lengths:
+        return False
+    total_length = sum(edge_lengths)
+
+    from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
+    from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Plane
+    adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
+    surface_type = adaptor.GetType()
+    if surface_type == GeomAbs_Cylinder:
+        radius = adaptor.Cylinder().Radius()
+    elif surface_type == GeomAbs_Plane:
+        vertex_explorer = TopExp_Explorer(outer_wire, TopAbs_VERTEX)
+        vertices = []
+        while vertex_explorer.More():
+            v = BRep_Tool.Pnt(vertex_explorer.Current())
+            vertices.append((v.X(), v.Y(), v.Z()))
+            vertex_explorer.Next()
+        if len(vertices) < 3:
+            return False
+        cx = sum(x for x, y, z in vertices) / len(vertices)
+        cy = sum(y for x, y, z in vertices) / len(vertices)
+        cz = sum(z for x, y, z in vertices) / len(vertices)
+        radius = sum(math.sqrt((x-cx)**2 + (y-cy)**2 + (z-cz)**2) for x, y, z in vertices) / len(vertices)
+    else:
+        return False
+
+    full_perimeter = 2 * math.pi * radius
+    if abs(total_length - full_perimeter) / full_perimeter < tol:
+        return True
+    else:
+        return False
+    
+def is_face_half_circle(face, piece_bbox=None, tol=0.2, lateral_tol=3.0):
+    """
+    Verifica se uma face é aproximadamente meia circunferência (180º) e está numa das laterais da peça.
+    Se for fornecido o bounding box da peça (piece_bbox), só retorna True se o centro do wire estiver perto da lateral.
+    """
+    from OCC.Core.BRepTools import breptools
+    from OCC.Core.TopExp import TopExp_Explorer
+    from OCC.Core.TopAbs import TopAbs_VERTEX, TopAbs_EDGE
+    from OCC.Core.BRep import BRep_Tool
+    import math
+
+    # Soma o comprimento de todas as arestas do wire
+    outer_wire = breptools.OuterWire(face)
+    edge_explorer = TopExp_Explorer(outer_wire, TopAbs_EDGE)
+    total_length = 0
+    while edge_explorer.More():
+        edge = edge_explorer.Current()
+        curve_handle, first, last = BRep_Tool.Curve(edge)
+        length = abs(last - first)
+        total_length += length
+        edge_explorer.Next()
+
+    # Calcula o centroide dos vértices do wire
+    vertex_explorer = TopExp_Explorer(outer_wire, TopAbs_VERTEX)
+    vertices = []
+    while vertex_explorer.More():
+        v = BRep_Tool.Pnt(vertex_explorer.Current())
+        vertices.append((v.X(), v.Y(), v.Z()))
+        vertex_explorer.Next()
+    if len(vertices) < 2:
+        return False
+
+    cx = sum(x for x, y, z in vertices) / len(vertices)
+    cy = sum(y for x, y, z in vertices) / len(vertices)
+    cz = sum(z for x, y, z in vertices) / len(vertices)
+    radius = sum(math.sqrt((x-cx)**2 + (y-cy)**2 + (z-cz)**2) for x, y, z in vertices) / len(vertices)
+
+    half_perimeter = math.pi * radius
+
+    # Só valida como meia-lua se a soma do wire for próxima de meia circunferência (180º)
+    if abs(total_length - half_perimeter) / half_perimeter < tol:
+        # Verificação extra: está perto de uma lateral da peça?
+        if piece_bbox is not None:
+            xmin, ymin, zmin, xmax, ymax, zmax = piece_bbox
+            close_to_side = (
+                abs(cx - xmin) < lateral_tol or
+                abs(cx - xmax) < lateral_tol or
+                abs(cy - ymin) < lateral_tol or
+                abs(cy - ymax) < lateral_tol
+            )
+            if not close_to_side:
+                return False  # Não está na lateral
+        return True
+    return False
 
 # === utils para rectangular_details.py ===
 
