@@ -355,36 +355,57 @@ def is_face_circular_complete(face, tol=0.05):
     else:
         return False
     
-def is_face_half_circle(face, piece_bbox=None, tol=0.2, lateral_tol=3.0):
+def is_face_half_circle(face, piece_bbox=None, tol=0.15, lateral_tol=10.0, min_arc_ratio=0.4):
     """
-    Verifica se uma face é aproximadamente meia circunferência (180º) e está numa das laterais da peça.
-    Se for fornecido o bounding box da peça (piece_bbox), só retorna True se o centro do wire estiver perto da lateral.
+    Deteta se a face é semicircular (meia-lua) próxima da lateral.
+    - min_arc_ratio: percentagem mínima do wire que deve ser arco.
     """
     from OCC.Core.BRepTools import breptools
     from OCC.Core.TopExp import TopExp_Explorer
     from OCC.Core.TopAbs import TopAbs_VERTEX, TopAbs_EDGE
     from OCC.Core.BRep import BRep_Tool
+    from OCC.Core.GeomAdaptor import GeomAdaptor_Curve
+    from OCC.Core.GeomAbs import GeomAbs_Circle
     import math
 
-    # Soma o comprimento de todas as arestas do wire
     outer_wire = breptools.OuterWire(face)
+
+    # 1. Coleta vértices e comprimento total do wire
     edge_explorer = TopExp_Explorer(outer_wire, TopAbs_EDGE)
     total_length = 0
+    arc_length = 0
+    edge_count = 0
+    has_arc = False
+
     while edge_explorer.More():
         edge = edge_explorer.Current()
         curve_handle, first, last = BRep_Tool.Curve(edge)
         length = abs(last - first)
         total_length += length
+
+        adaptor = GeomAdaptor_Curve(curve_handle, first, last)
+        if adaptor.GetType() == GeomAbs_Circle:
+            arc_length += length
+            has_arc = True
+
+        edge_count += 1
         edge_explorer.Next()
 
-    # Calcula o centroide dos vértices do wire
+    if not has_arc or edge_count < 4:
+        return False
+
+    arc_ratio = arc_length / total_length if total_length > 0 else 0
+    if arc_ratio < min_arc_ratio:
+        return False
+
+    # 2. Calcula centroide e raio médio
     vertex_explorer = TopExp_Explorer(outer_wire, TopAbs_VERTEX)
     vertices = []
     while vertex_explorer.More():
         v = BRep_Tool.Pnt(vertex_explorer.Current())
         vertices.append((v.X(), v.Y(), v.Z()))
         vertex_explorer.Next()
-    if len(vertices) < 2:
+    if len(vertices) < 4:
         return False
 
     cx = sum(x for x, y, z in vertices) / len(vertices)
@@ -394,9 +415,8 @@ def is_face_half_circle(face, piece_bbox=None, tol=0.2, lateral_tol=3.0):
 
     half_perimeter = math.pi * radius
 
-    # Só valida como meia-lua se a soma do wire for próxima de meia circunferência (180º)
+    # 3. Wire deve ser próximo de meia circunferência
     if abs(total_length - half_perimeter) / half_perimeter < tol:
-        # Verificação extra: está perto de uma lateral da peça?
         if piece_bbox is not None:
             xmin, ymin, zmin, xmax, ymax, zmax = piece_bbox
             close_to_side = (
@@ -406,8 +426,9 @@ def is_face_half_circle(face, piece_bbox=None, tol=0.2, lateral_tol=3.0):
                 abs(cy - ymax) < lateral_tol
             )
             if not close_to_side:
-                return False  # Não está na lateral
+                return False
         return True
+
     return False
 
 # === utils para rectangular_details.py ===
@@ -645,6 +666,79 @@ def group_all_planar_faces(shape):
             faces.append(face)
         explorer.Next()
     return faces
+
+# === utils para semi_circular_details.py ===
+
+def collect_semi_circular_arcs(shape, lateral_tol=3.0):
+    """
+    Procura todos os arcos circulares ~180º perto da lateral e retorna info relevante.
+    """
+    from OCC.Core.BRep import BRep_Tool
+    from OCC.Core.TopExp import TopExp_Explorer
+    from OCC.Core.TopAbs import TopAbs_EDGE
+    from OCC.Core.GeomAbs import GeomAbs_Circle
+    from OCC.Core.GeomAdaptor import GeomAdaptor_Curve
+    import math
+
+    piece_bbox = get_bbox(shape)
+    results = []
+
+    explorer = TopExp_Explorer(shape, TopAbs_EDGE)
+    while explorer.More():
+        edge = explorer.Current()
+        curve_handle, first, last = BRep_Tool.Curve(edge)
+        adaptor = GeomAdaptor_Curve(curve_handle, first, last)
+        if adaptor.GetType() == GeomAbs_Circle:
+            circ = adaptor.Circle()
+            center = circ.Location()
+            radius = circ.Radius()
+            angle = abs(math.degrees(last - first))
+            if 150 <= angle <= 210:
+                x, y, z = center.X(), center.Y(), center.Z()
+                xmin, ymin, zmin, xmax, ymax, zmax = piece_bbox
+                near_lateral = (
+                    abs(x - xmin) < lateral_tol or abs(x - xmax) < lateral_tol or
+                    abs(y - ymin) < lateral_tol or abs(y - ymax) < lateral_tol
+                )
+                if near_lateral:
+                    results.append({
+                        'center': (x, y, z),
+                        'x': x,
+                        'y': y,
+                        'z': z,
+                        'radius': radius,
+                        'angle': angle,
+                        'area': 0.5 * math.pi * radius ** 2
+                    })
+        explorer.Next()
+    return results
+
+def group_semi_circular_arcs(raw_results, group_tol=3.0):
+    """
+    Agrupa arcos semicirculares com o mesmo X/Y (tolerância), para evitar duplicados por cada semicirculo real.
+    """
+    grouped = []
+    for item in raw_results:
+        x, y = item['x'], item['y']
+        found = False
+        for group in grouped:
+            gx, gy = group['xy']
+            if abs(x - gx) < group_tol and abs(y - gy) < group_tol:
+                group['zs'].append(item['z'])
+                group['radii'].append(item['radius'])
+                group['angles'].append(item['angle'])
+                group['areas'].append(item['area'])
+                found = True
+                break
+        if not found:
+            grouped.append({
+                'xy': (x, y),
+                'zs': [item['z']],
+                'radii': [item['radius']],
+                'angles': [item['angle']],
+                'areas': [item['area']]
+            })
+    return grouped
 
 # === utils auxiliares (usados em várias partes) ===
 

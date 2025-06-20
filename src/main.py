@@ -2,7 +2,7 @@ from .loader import load_step_file, choose_file_from_folder
 from .main_details import show_general_summary
 from .cylindrical_details import get_circular_hole_diameters_by_type, show_circular_hole_details
 from .rectangular_details import show_rectangular_details
-from .operations_details import show_operations_details  # NOVO!
+from .semi_circular_details import show_semi_circular_details
 
 def main():
     folder = "stp_igs_files"
@@ -21,7 +21,7 @@ def main():
         print("1 - Resumo da peça para o GESTi")
         print("2 - Detalhes dos furos redondos")
         print("3 - Detalhes dos furos retangulares")
-        print("4 - Detalhes de posição e operações")
+        print("4 - Detalhes dos semicírculos")
         print("5 - Escolher outro ficheiro")
         print("0 - Sair")
 
@@ -38,7 +38,7 @@ def main():
             show_rectangular_details(shape)
         
         elif opcao == "4":
-            show_operations_details(shape, filepath)  # Nova função, ver abaixo
+            show_semi_circular_details(shape)
         
         elif opcao == "5":
             new_path = choose_file_from_folder(folder)
