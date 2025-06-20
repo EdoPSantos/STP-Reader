@@ -1,7 +1,6 @@
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepBndLib import brepbndlib
-from OCC.Core.BRepTools import breptools
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.TopAbs import TopAbs_EDGE
 from collections import Counter
@@ -9,44 +8,24 @@ from .utils import (
     extract_mold_and_part_from_step, detect_positions_from_holes,
     group_faces_by_axis_and_proximity, get_auto_loc_tol,
     group_non_circular_planar_faces, auto_filter_rectangular_faces,
-    get_piece_dimensions, find_slots, get_bbox, is_open_edge, 
-    get_circular_hole_diameters_by_type, is_face_circular_complete,
-    get_all_radii_of_group, is_face_half_circle, get_face_area
+    get_piece_dimensions, find_slots, get_bbox, is_open_edge,
+    get_all_radii_of_group, get_face_area, is_face_circular_complete,
+    collect_semi_circular_arcs, group_semi_circular_arcs
 )
-
 import os
 
-def show_general_summary(shape, filepath=None):
-    """
-    Mostra um resumo geral da peça: dimensões, quantidade de furos circulares e retangulares/quadrados,
-    e lista todos os diâmetros/medidas encontradas.
-    """
+# Função utilitária para comparar centros e diâmetros com tolerância
+def is_duplicate_circle(center1, d1, list_centers, list_ds, center_tol=3.0, d_tol=2.0):
+    for i, c2 in enumerate(list_centers):
+        if abs(center1[0] - c2[0]) < center_tol and abs(center1[1] - c2[1]) < center_tol:
+            if abs(d1 - list_ds[i]) < d_tol:
+                return True
+    return False
 
-    # 1. Identificação do molde e peça
-    mold, part = None, None
-    if filepath:
-        mold, part = extract_mold_and_part_from_step(filepath)
-        mold_name = f"{mold}" if mold else "(não identificado)"
-        part_name = f"{part}" if part else "(não identificada)"
-    else:
-        mold_name = "(desconhecido)"
-        part_name = "(desconhecida)"
-
-    # 2. Dimensões globais da peça
-    bbox = Bnd_Box()
-    brepbndlib.Add(shape, bbox)
-    bbox_coords = bbox.Get()  # <- IMPORTANTE: obter coordenadas!
-    xmin, ymin, zmin, xmax, ymax, zmax = bbox_coords
-    dim1 = abs(xmax - xmin)
-    dim2 = abs(ymax - ymin)
-    # O maior vai para "Largura", o menor para "Comprimento"
-    largura = max(dim1, dim2)
-    comprimento = min(dim1, dim2)
-
-    # 4. Slots oblongos e furos retangulares/quadrados
+# 1. Furos retangulares/quadrados
+def get_rectangular_holes(shape):
     slots = find_slots(shape)
     slot_counter = Counter(slots)
-
     faces = group_non_circular_planar_faces(shape)
     filtered_faces = auto_filter_rectangular_faces(faces)
     piece_length, piece_width = get_piece_dimensions(shape)
@@ -56,7 +35,6 @@ def show_general_summary(shape, filepath=None):
 
     rectangular_counter = Counter()
     for face, shape_type, rlength, rwidth in filtered_faces:
-        # Ignora slots abertos
         if is_open_edge(face, piece_bbox, tol=2.0):
             continue
         is_face_exterior = (
@@ -65,10 +43,8 @@ def show_general_summary(shape, filepath=None):
         )
         if is_face_exterior and not is_open_edge(face, piece_bbox, tol=abs_tol):
             continue
-        # Evita duplicados de slots
         if any(abs(rlength - slen) < 2.0 and abs(rwidth - swid) < 2.0 for (slen, swid) in slot_counter):
             continue
-        # Elimina casos extremos (faces demasiado grandes)
         if (
             rlength > rel_tol * piece_length or
             rwidth > rel_tol * piece_width or
@@ -78,45 +54,103 @@ def show_general_summary(shape, filepath=None):
             continue
         key = (shape_type, rlength, rwidth)
         rectangular_counter[key] += 1
+    return rectangular_counter
 
-    # Agrupa furos circulares por eixo e proximidade (como nos detalhes cilíndricos)
+# 2. Furos circulares (mas só únicos)
+def get_circular_holes(shape):
     axis_groups = group_faces_by_axis_and_proximity(shape, loc_tol=get_auto_loc_tol(shape))
-    positions = detect_positions_from_holes(axis_groups, shape)
-
-    diameters = []
-
-    # Processamento dos furos circulares/meia-lua
+    features = []
     for faces in axis_groups:
+        main_face = max((f[1] for f in faces), key=get_face_area)
         radii, _ = get_all_radii_of_group(faces)
         if not radii:
             continue
-        # Seleciona a face de maior área do grupo para testar o tipo
-        main_face = max((f[1] for f in faces), key=get_face_area)
-        outer_wire = breptools.OuterWire(main_face)
-        edge_explorer = TopExp_Explorer(outer_wire, TopAbs_EDGE)
-        edge_count = 0
-        while edge_explorer.More():
-            edge_count += 1
-            edge_explorer.Next()
-        print(f"Face: {main_face}, área: {get_face_area(main_face):.2f}, nº de arestas no wire: {edge_count}, raio mínimo: {min(radii)}")
-
-        # AQUI: Passar as coordenadas, não o objeto!
-        if is_face_half_circle(main_face, piece_bbox=bbox_coords):
-            min_r = round(min(radii), 2)
-            max_r = round(max(radii), 2)
-            print(f"DEBUG: ENCONTREI UM MEIA-LUA com raio(s) {min_r} a {max_r}, face={main_face}")
-            diameters.append((min_r, max_r))
+        min_d = round(min(radii) * 2, 2)
+        max_d = round(max(radii) * 2, 2)
+        from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
+        from OCC.Core.GeomAbs import GeomAbs_Cylinder
+        adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(main_face))
+        if adaptor.GetType() == GeomAbs_Cylinder:
+            axis = adaptor.Cylinder().Axis()
+            loc = axis.Location()
+            center_tuple = (round(loc.X(), 2), round(loc.Y(), 2))
         else:
-            min_d = round(min(radii) * 2, 2)
-            max_d = round(max(radii) * 2, 2)
-            diameters.append((min_d, max_d))
+            bbox = get_bbox(main_face)
+            cx = (bbox[0] + bbox[3]) / 2
+            cy = (bbox[1] + bbox[4]) / 2
+            center_tuple = (round(cx, 2), round(cy, 2))
+        features.append({
+            'center': center_tuple,
+            'min_d': min_d,
+            'max_d': max_d
+        })
+    return features
 
-    count_cylindrical = len(diameters)
-    diam_counter = Counter()
-    for min_d, max_d in diameters:
-        diam_counter[(min_d, max_d)] += 1
+# 3. Recortes semicirculares (guardar centros e raios)
+def get_semi_circular_holes(shape, group_tol=3.0, lateral_tol=3.0):
+    raw_semicircles = collect_semi_circular_arcs(shape, lateral_tol=lateral_tol)
+    grouped_semicircles = group_semi_circular_arcs(raw_semicircles, group_tol=group_tol)
+    semi_features = []
+    for g in grouped_semicircles:
+        rmin, rmax = round(min(g['radii']), 2), round(max(g['radii']), 2)
+        center = (round(g['xy'][0],2), round(g['xy'][1],2))
+        semi_features.append({
+            'center': center,
+            'min_d': rmin,
+            'max_d': rmax,
+            'group': g  # Para debug/impressão
+        })
+    return semi_features
 
-    # 6. Output formatado (mantido igual)
+def is_near(center1, center2, tol=3.0):
+    return abs(center1[0] - center2[0]) < tol and abs(center1[1] - center2[1]) < tol
+
+def is_same_diameter(d1, d2, tol=2.0):
+    return abs(d1 - d2) < tol
+
+# Função para verificar se o círculo é duplicado por algum semicircular
+def is_duplicate_with_semi(center, d, semi_features, center_tol=3.0, d_tol=2.0):
+    for sf in semi_features:
+        if abs(center[0] - sf['center'][0]) < center_tol and abs(center[1] - sf['center'][1]) < center_tol:
+            if abs(d - sf['min_d']) < d_tol or abs(d - sf['max_d']) < d_tol:
+                return True
+    return False
+
+# Função principal para o sumário geral
+def show_general_summary(shape, filepath=None):
+    semi_features = get_semi_circular_holes(shape)
+    circular_features = get_circular_holes(shape)
+    rectangular_counter = get_rectangular_holes(shape)
+
+    # Contadores por faixa de diâmetro para circulares e semicirculares juntos
+    all_counter = Counter()
+    # Circulares
+    for feat in circular_features:
+        all_counter[(feat['min_d'], feat['max_d'])] += 1
+    # Semicirculares (cada um como se fosse um furo circular extra, como pediste)
+    for semi in semi_features:
+        all_counter[(semi['min_d'], semi['max_d'])] += 1
+
+    # --- Mold e peça
+    if filepath:
+        mold, part = extract_mold_and_part_from_step(filepath)
+        mold_name = f"{mold}" if mold else "(não identificado)"
+        part_name = f"{part}" if part else "(não identificada)"
+    else:
+        mold_name = "(desconhecido)"
+        part_name = "(desconhecida)"
+
+    # --- Dimensões globais
+    bbox = Bnd_Box()
+    brepbndlib.Add(shape, bbox)
+    bbox_coords = bbox.Get()
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox_coords
+    dim1 = abs(xmax - xmin)
+    dim2 = abs(ymax - ymin)
+    largura = max(dim1, dim2)
+    comprimento = min(dim1, dim2)
+
+    # --- OUTPUT
     print("=" * 40)
     print("   RESUMO DA PEÇA PARA O GESTi")
     print("=" * 40)
@@ -124,26 +158,21 @@ def show_general_summary(shape, filepath=None):
     print(f"Peça: {part_name}")
     print(f"Largura: {largura:.0f} mm")
     print(f"Comprimento: {comprimento:.0f} mm")
-    print(f"Posições: {positions}")
-    print(f"Qtd. furos circulares: {count_cylindrical}")
+    print(f"Qtd. furos circulares (inclui semicirculares): {sum(all_counter.values())}")
     print(f"Qtd. furos quadrados/retangulares: {sum(rectangular_counter.values())}")
-    print("\n")
-    print("-" * 40)
+    print("\n" + "-" * 40)
 
-    # Furos circulares
-    if diameters:
-        print("Furos circulares:")
-        for (min_d, max_d), count in sorted(diam_counter.items(), key=lambda x: -x[0][1]):  # Ordena pelo diâmetro máximo desc
+    print("Furos circulares (inclui semicirculares):")
+    if all_counter:
+        for (min_d, max_d), count in sorted(all_counter.items(), key=lambda x: -x[0][1]):
             if min_d == max_d:
                 print(f"  Tem {count} furo(s) com {min_d} mm de diâmetro")
             else:
                 print(f"  Tem {count} furo(s) de {min_d} mm a {max_d} mm de diâmetro")
     else:
-        print("Furos circulares: não extraídos")
-
-    print("\n")
+        print("  Nenhum furo circular encontrado.")
+        
     print("-" * 40)
-    # Furos retangulares/quadrados internos
     if rectangular_counter:
         print("Furos retangulares/quadrados internos:")
         for (shape_type, rlength, rwidth), count in sorted(rectangular_counter.items(), key=lambda x: (-x[0][1], -x[0][2])):
@@ -153,5 +182,4 @@ def show_general_summary(shape, filepath=None):
                 print(f"  Tem {count} furo(s) [retangular] com {rlength} mm de comprimento e {rwidth} mm de largura")
     else:
         print("Furos retangulares/quadrados internos: não extraídos")
-    print("\n")
     print("=" * 40)

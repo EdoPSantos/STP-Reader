@@ -1,4 +1,4 @@
-from .utils import get_bbox, collect_semi_circular_arcs, group_semi_circular_arcs
+from .utils import collect_semi_circular_arcs, group_semi_circular_arcs
 
 def show_semi_circular_details(shape):
     """

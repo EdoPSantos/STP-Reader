@@ -302,11 +302,9 @@ def get_all_radii_of_group(faces, min_allowed=3.0):
     radii = sorted(set(round(r, 2) for r in radii))
     return radii, has_cone
 
-def is_face_circular_complete(face, tol=0.05):
+def is_face_circular_complete(face, tol=0.20):
     """
     Verifica se uma face cilíndrica/plana circular é uma circunferência completa ou um arco/parcial.
-    Retorna True se for completa, False se for parcial.
-    - tol: tolerância relativa (ex: 0.05 == 5%)
     """
     from OCC.Core.BRepTools import breptools
     from OCC.Core.TopExp import TopExp_Explorer
@@ -350,10 +348,12 @@ def is_face_circular_complete(face, tol=0.05):
         return False
 
     full_perimeter = 2 * math.pi * radius
-    if abs(total_length - full_perimeter) / full_perimeter < tol:
+
+    percent = total_length / full_perimeter
+    # Usar tolerância mais conservadora (20% de diferença)
+    if percent >= (1 - tol):
         return True
-    else:
-        return False
+    return False
     
 def is_face_half_circle(face, piece_bbox=None, tol=0.15, lateral_tol=10.0, min_arc_ratio=0.4):
     """
@@ -669,20 +669,53 @@ def group_all_planar_faces(shape):
 
 # === utils para semi_circular_details.py ===
 
-def collect_semi_circular_arcs(shape, lateral_tol=3.0):
+def collect_circular_holes(shape, tol=1.0):
     """
-    Procura todos os arcos circulares ~180º perto da lateral e retorna info relevante.
+    Recolhe todos os furos circulares completos da peça, agrupando por centro e raio (tolerância).
+    Retorna uma lista de tuplos: (centro_x, centro_y, centro_z, raio)
+    """
+    from OCC.Core.BRep import BRep_Tool
+    from OCC.Core.TopExp import TopExp_Explorer
+    from OCC.Core.TopAbs import TopAbs_FACE
+    from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
+    from OCC.Core.GeomAbs import GeomAbs_Cylinder
+    import math
+
+    groups = []
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    while explorer.More():
+        face = explorer.Current()
+        adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
+        if adaptor.GetType() == GeomAbs_Cylinder:
+            cyl = adaptor.Cylinder()
+            x, y, z = cyl.Axis().Location().X(), cyl.Axis().Location().Y(), cyl.Axis().Location().Z()
+            r = cyl.Radius()
+            # Agrupa por centro e raio
+            found = False
+            for g in groups:
+                gx, gy, gz, gr = g
+                if (abs(gx-x) < tol and abs(gy-y) < tol and abs(gz-z) < tol and abs(gr-r) < tol):
+                    found = True
+                    break
+            if not found:
+                groups.append((x, y, z, r))
+        explorer.Next()
+    return groups
+
+def collect_semi_circular_arcs(shape, lateral_tol=3.0, angle_tol=30.0, radius_tol=1.0):
+    """
+    Recolhe todos os recortes semicirculares (arcos ~180º perto da lateral) e devolve lista de dicts:
+    {'center': (x, y, z), 'radius': r, 'angle': angle}
     """
     from OCC.Core.BRep import BRep_Tool
     from OCC.Core.TopExp import TopExp_Explorer
     from OCC.Core.TopAbs import TopAbs_EDGE
-    from OCC.Core.GeomAbs import GeomAbs_Circle
     from OCC.Core.GeomAdaptor import GeomAdaptor_Curve
+    from OCC.Core.GeomAbs import GeomAbs_Circle
     import math
 
-    piece_bbox = get_bbox(shape)
     results = []
-
+    piece_bbox = get_bbox(shape)
     explorer = TopExp_Explorer(shape, TopAbs_EDGE)
     while explorer.More():
         edge = explorer.Current()
@@ -691,9 +724,10 @@ def collect_semi_circular_arcs(shape, lateral_tol=3.0):
         if adaptor.GetType() == GeomAbs_Circle:
             circ = adaptor.Circle()
             center = circ.Location()
-            radius = circ.Radius()
+            r = circ.Radius()
             angle = abs(math.degrees(last - first))
-            if 150 <= angle <= 210:
+            # Só arcos semicirculares (aprox 180º)
+            if 180 - angle_tol <= angle <= 180 + angle_tol:
                 x, y, z = center.X(), center.Y(), center.Z()
                 xmin, ymin, zmin, xmax, ymax, zmax = piece_bbox
                 near_lateral = (
@@ -701,42 +735,65 @@ def collect_semi_circular_arcs(shape, lateral_tol=3.0):
                     abs(y - ymin) < lateral_tol or abs(y - ymax) < lateral_tol
                 )
                 if near_lateral:
-                    results.append({
-                        'center': (x, y, z),
-                        'x': x,
-                        'y': y,
-                        'z': z,
-                        'radius': radius,
-                        'angle': angle,
-                        'area': 0.5 * math.pi * radius ** 2
-                    })
+                    # Não duplica semicirculo já existente
+                    found = False
+                    for rec in results:
+                        rx, ry, rz = rec['center']
+                        rr = rec['radius']
+                        if (abs(rx-x) < radius_tol and abs(ry-y) < radius_tol and abs(rz-z) < radius_tol and abs(rr-r) < radius_tol):
+                            found = True
+                            break
+                    if not found:
+                        results.append({'center': (x, y, z), 'radius': r, 'angle': angle})
         explorer.Next()
     return results
 
-def group_semi_circular_arcs(raw_results, group_tol=3.0):
+def group_diameters_by_tolerance(diameters, tolerance=1.0):
     """
-    Agrupa arcos semicirculares com o mesmo X/Y (tolerância), para evitar duplicados por cada semicirculo real.
+    Agrupa diâmetros (float) por intervalos/tolerância.
+    Recebe lista de (diâmetro) ou (min_d, max_d).
+    Devolve Counter com intervalos como tuplos.
+    """
+    grouped = {}
+    for dtuple in diameters:
+        if isinstance(dtuple, (tuple, list)) and len(dtuple) == 2:
+            min_d, max_d = dtuple
+        else:
+            min_d = max_d = dtuple
+        found = False
+        for key in grouped:
+            kmin, kmax = key
+            if abs(kmin - min_d) < tolerance and abs(kmax - max_d) < tolerance:
+                grouped[key] += 1
+                found = True
+                break
+        if not found:
+            grouped[(min_d, max_d)] = 1
+    return Counter(grouped)
+
+def group_semi_circular_arcs(arcs, group_tol=3.0):
+    """
+    Agrupa arcos semicirculares por centro X/Y (não por Z), tolerância em mm.
     """
     grouped = []
-    for item in raw_results:
-        x, y = item['x'], item['y']
+    for arc in arcs:
+        x, y, z = arc['center']
+        r = arc['radius']
         found = False
-        for group in grouped:
-            gx, gy = group['xy']
+        for g in grouped:
+            gx, gy = g['xy']
             if abs(x - gx) < group_tol and abs(y - gy) < group_tol:
-                group['zs'].append(item['z'])
-                group['radii'].append(item['radius'])
-                group['angles'].append(item['angle'])
-                group['areas'].append(item['area'])
+                g['zs'].append(z)
+                g['radii'].append(r)
+                g['angles'].append(arc['angle'])
                 found = True
                 break
         if not found:
             grouped.append({
                 'xy': (x, y),
-                'zs': [item['z']],
-                'radii': [item['radius']],
-                'angles': [item['angle']],
-                'areas': [item['area']]
+                'zs': [z],
+                'radii': [r],
+                'angles': [arc['angle']]
             })
     return grouped
 
@@ -762,24 +819,6 @@ def get_bbox_faces_touched(pnt, bbox, tol=0.5):
     if abs(pnt.Z() - zmin) < tol: faces.append("zmin")
     if abs(pnt.Z() - zmax) < tol: faces.append("zmax")
     return faces
-
-def project_point_to_bbox(loc, dir, bounds):
-    px, py, pz = loc.X(), loc.Y(), loc.Z()
-    dx, dy, dz = dir.X(), dir.Y(), dir.Z()
-    if abs(dx) < 1e-8: dx = 1e-8
-    if abs(dy) < 1e-8: dy = 1e-8
-    if abs(dz) < 1e-8: dz = 1e-8
-
-    t_values = []
-    for i, (min_b, max_b, p, d) in enumerate(zip(bounds[:3], bounds[3:], [px, py, pz], [dx, dy, dz])):
-        t1 = (min_b - p) / d
-        t2 = (max_b - p) / d
-        t_values.extend([t1, t2])
-    t_values = [t for t in t_values if t > 0]
-    if not t_values:
-        return loc
-    t = min(t_values)
-    return gp_Pnt(px + t*dx, py + t*dy, pz + t*dz)
 
 def group_faces_by_axis_and_proximity(shape, loc_tol=2.0, dir_tol=0.05):
     """
@@ -852,3 +891,23 @@ def get_auto_loc_tol(shape):
         return 5.0
     else:
         return 10.0
+    
+# === utils auxiliares (usados caso necessário) ===
+
+def project_point_to_bbox(loc, dir, bounds):
+    px, py, pz = loc.X(), loc.Y(), loc.Z()
+    dx, dy, dz = dir.X(), dir.Y(), dir.Z()
+    if abs(dx) < 1e-8: dx = 1e-8
+    if abs(dy) < 1e-8: dy = 1e-8
+    if abs(dz) < 1e-8: dz = 1e-8
+
+    t_values = []
+    for i, (min_b, max_b, p, d) in enumerate(zip(bounds[:3], bounds[3:], [px, py, pz], [dx, dy, dz])):
+        t1 = (min_b - p) / d
+        t2 = (max_b - p) / d
+        t_values.extend([t1, t2])
+    t_values = [t for t in t_values if t > 0]
+    if not t_values:
+        return loc
+    t = min(t_values)
+    return gp_Pnt(px + t*dx, py + t*dy, pz + t*dz)
