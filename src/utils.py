@@ -719,7 +719,11 @@ def collect_semi_circular_arcs(shape, lateral_tol=3.0, angle_tol=30.0, radius_to
     explorer = TopExp_Explorer(shape, TopAbs_EDGE)
     while explorer.More():
         edge = explorer.Current()
-        curve_handle, first, last = BRep_Tool.Curve(edge)
+        curve_data = BRep_Tool.Curve(edge)
+        if not curve_data or len(curve_data) < 3:
+            explorer.Next()
+            continue
+        curve_handle, first, last = curve_data
         adaptor = GeomAdaptor_Curve(curve_handle, first, last)
         if adaptor.GetType() == GeomAbs_Circle:
             circ = adaptor.Circle()
