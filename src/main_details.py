@@ -10,7 +10,8 @@ from .utils import (
     group_non_circular_planar_faces, auto_filter_rectangular_faces,
     get_piece_dimensions, find_slots, get_bbox, is_open_edge,
     get_all_radii_of_group, get_face_area,
-    collect_semi_circular_arcs, group_semi_circular_arcs
+    collect_semi_circular_arcs, group_semi_circular_arcs,
+    group_diameters_by_tolerance, group_holes_by_center
 )
 import os
 
@@ -91,6 +92,15 @@ def get_circular_holes(shape, semi_features=None):
         if semi_features and is_grouped_with_semi_arc(center_tuple, max_d, semi_features):
             continue
 
+        # Ignora duplicados entre furos circulares (comparando centro e diâmetro)
+        if any(
+            abs(center_tuple[0] - f['center'][0]) < 3.0 and
+            abs(center_tuple[1] - f['center'][1]) < 3.0 and
+            abs(max_d - f['max_d']) < 2.0
+            for f in features
+        ):
+            continue
+
         features.append({
             'center': center_tuple,
             'min_d': min_d,
@@ -148,14 +158,8 @@ def show_general_summary(shape, filepath=None):
     hole_groups = group_faces_by_axis_and_proximity(shape, loc_tol=get_auto_loc_tol(shape))
     positions = detect_positions_from_holes(hole_groups, shape)
 
-    # Contadores por faixa de diâmetro para circulares e semicirculares juntos
-    all_counter = Counter()
-    # Circulares (ignora duplicados com semicirculares)
-    for feat in circular_features:
-        all_counter[(feat['min_d'], feat['max_d'])] += 1
-    # Semicirculares (cada um como se fosse um furo circular extra, como pediste)
-    for semi in semi_features:
-        all_counter[(semi['min_d'], semi['max_d'])] += 1
+    # Agrupamento de furos com base na posição do centro (evita duplicações)
+    all_counter = group_holes_by_center(circular_features + semi_features)
 
     # --- Mold e peça
     if filepath:
@@ -193,9 +197,9 @@ def show_general_summary(shape, filepath=None):
     if all_counter:
         for (min_d, max_d), count in sorted(all_counter.items(), key=lambda x: -x[0][1]):
             if min_d == max_d:
-                print(f"  Tem {count} furo(s) com {min_d} mm de diâmetro")
+                print(f"  Tem {count} furo(s) com {min_d:.1f} mm de diâmetro")
             else:
-                print(f"  Tem {count} furo(s) de {min_d} mm a {max_d} mm de diâmetro")
+                print(f"  Tem {count} furo(s) de {min_d:.1f} mm a {max_d:.1f} mm de diâmetro")
     else:
         print("  Nenhum furo circular encontrado.")
         

@@ -5,6 +5,7 @@ import os
 import re
 import math
 import numpy as np
+from collections import Counter
 from collections import defaultdict
 
 # === OCC / pythonocc-core ===
@@ -126,17 +127,17 @@ def extract_mold_and_part_from_step(filepath):
     return None, None
 
 def detect_positions_from_holes(axis_groups, shape):
-    bbox = Bnd_Box()
-    brepbndlib.Add(shape, bbox)
-    bounds = bbox.Get()
-    zmin, zmax = bounds[2], bounds[5]
-    thickness = zmax - zmin
-
+    """
+    Detecta o número de posições necessárias para maquinar os furos:
+    - 1 posição: todos passantes ou todos do mesmo lado
+    - 2 posições: há cones/furos sem fundo em direções opostas
+    """
     has_cone_up = False
     has_cone_down = False
     deep_blind_hole = False
 
     for faces in axis_groups:
+        # ❗️Ignorar grupos passantes
         if is_hole_through(faces, shape):
             continue
 
@@ -148,18 +149,27 @@ def detect_positions_from_holes(axis_groups, shape):
                 elif dir_z < -0.5:
                     has_cone_down = True
             elif stype == GeomAbs_Cylinder:
-                face_bbox = Bnd_Box()
-                brepbndlib.Add(face, face_bbox)
-                _, _, fzmin, _, _, fzmax = face_bbox.Get()
-                depth = abs(fzmax - fzmin)
+                # Verifica profundidade da face (para detectar furos cegos profundos)
+                bbox = Bnd_Box()
+                brepbndlib.Add(face, bbox)
+                _, _, zmin, _, _, zmax = bbox.Get()
+                depth = abs(zmax - zmin)
+                # Apenas considera como furo cego profundo se tiver mais de 90% da espessura
+                shape_bbox = Bnd_Box()
+                brepbndlib.Add(shape, shape_bbox)
+                _, _, szmin, _, _, szmax = shape_bbox.Get()
+                thickness = abs(szmax - szmin)
                 if depth > 0.9 * thickness:
                     deep_blind_hole = True
 
-    if (has_cone_up and has_cone_down) or (deep_blind_hole and (has_cone_up or has_cone_down)):
+    # Avaliação final
+    if (has_cone_up and has_cone_down):
+        return 2
+    if deep_blind_hole and (has_cone_up or has_cone_down):
         return 2
     if has_cone_up or has_cone_down or deep_blind_hole:
-        return 2
-    return 1
+        return 1
+    return 1  # Todos os furos eram passantes
 
 # === utils para cylindrical_details.py ===
 
@@ -752,11 +762,9 @@ def collect_semi_circular_arcs(shape, lateral_tol=3.0, angle_tol=30.0, radius_to
         explorer.Next()
     return results
 
-def group_diameters_by_tolerance(diameters, tolerance=1.0):
+def group_diameters_by_tolerance(diameters, tolerance=2.0):
     """
-    Agrupa diâmetros (float) por intervalos/tolerância.
-    Recebe lista de (diâmetro) ou (min_d, max_d).
-    Devolve Counter com intervalos como tuplos.
+    Agrupa pares de (min_d, max_d) por tolerância, para evitar entradas muito próximas separadas.
     """
     grouped = {}
     for dtuple in diameters:
@@ -764,16 +772,57 @@ def group_diameters_by_tolerance(diameters, tolerance=1.0):
             min_d, max_d = dtuple
         else:
             min_d = max_d = dtuple
+
         found = False
         for key in grouped:
             kmin, kmax = key
+            # Se os diâmetros forem semelhantes, agrupa
             if abs(kmin - min_d) < tolerance and abs(kmax - max_d) < tolerance:
                 grouped[key] += 1
                 found = True
                 break
+
         if not found:
             grouped[(min_d, max_d)] = 1
+
     return Counter(grouped)
+
+def group_holes_by_center(features, center_tol=3.0):
+    """
+    Agrupa furos (circulares e semicirculares) com base na proximidade do centro (x, y)
+    e calcula o min/max diâmetro de cada grupo. Evita duplicados.
+    """
+    grouped_by_center = []
+
+    for feat in features:
+        cx, cy = feat['center']
+        min_d, max_d = feat['min_d'], feat['max_d']
+        added = False
+
+        for group in grouped_by_center:
+            gx, gy = group['center']
+            if abs(cx - gx) < center_tol and abs(cy - gy) < center_tol:
+                group['min_d'] = min(group['min_d'], min_d)
+                group['max_d'] = max(group['max_d'], max_d)
+                group['count'] += 1
+                added = True
+                break
+
+        if not added:
+            grouped_by_center.append({
+                'center': (cx, cy),
+                'min_d': min_d,
+                'max_d': max_d,
+                'count': 1
+            })
+
+    # Reorganiza os grupos para mostrar no resumo
+    all_counter = Counter()
+    for group in grouped_by_center:
+        key = (round(group['min_d'], 1), round(group['max_d'], 1))
+        all_counter[key] += 1
+
+    return all_counter
 
 def group_semi_circular_arcs(arcs, group_tol=3.0):
     """
