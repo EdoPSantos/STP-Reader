@@ -9,6 +9,7 @@ def show_semi_circular_details(shape):
 
     # 1. Recolhe todos os arcos semicirculares candidatos
     raw_results = collect_semi_circular_arcs(shape, lateral_tol=lateral_tol)
+    
     # 2. Agrupa por X/Y
     grouped = group_semi_circular_arcs(raw_results, group_tol=group_tol)
 

@@ -1,96 +1,24 @@
-# === Funções Globais (usadas por múltiplos ficheiros) ===
-
-# === Módulos padrão ===
+import numpy as np
+import math
 import os
 import re
-import math
-import numpy as np
-from collections import Counter
 from collections import defaultdict
-
-# === OCC / pythonocc-core ===
-from OCC.Core.gp import gp_Pnt, gp_Vec, gp_Dir
-from OCC.Core.Bnd import Bnd_Box
-from OCC.Core.BRep import BRep_Tool
-from OCC.Core.BRepBndLib import brepbndlib
-
-from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Plane
-from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
-
-from OCC.Core.TopAbs import TopAbs_VERTEX, TopAbs_FACE
-from OCC.Core.TopExp import TopExp_Explorer
-
+from collections import Counter
 from OCC.Core.TopoDS import TopoDS_Shape, topods, TopoDS_Face, TopoDS_Wire, TopoDS_Vertex
+from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Plane
 from OCC.Core.TopTools import TopTools_IndexedMapOfShape
-
+from OCC.Core.TopAbs import TopAbs_VERTEX, TopAbs_FACE
+from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
+from OCC.Core.gp import gp_Pnt, gp_Vec, gp_Dir
+from OCC.Core.TopExp import TopExp_Explorer
+from OCC.Core.BRepBndLib import brepbndlib
 from OCC.Core.BRepGProp import brepgprop
 from OCC.Core.BRepTools import breptools
 from OCC.Core.GProp import GProp_GProps
+from OCC.Core.BRep import BRep_Tool
+from OCC.Core.Bnd import Bnd_Box
 
-# Utilitário para gerar chave de agrupamento de furos por eixo
-
-def axis_key(adaptor, loc_tol=0.2, dir_tol=0.02):
-    """
-    Gera uma chave de agrupamento baseada no centro (location) e direção (direction) do eixo,
-    ambos arredondados para permitir pequenas variações (tolerância).
-    - loc_tol: tolerância para a localização do centro (em mm)
-    - dir_tol: tolerância para a direção do eixo (unitário)
-    """
-    surface_type = adaptor.GetType()
-    if surface_type == GeomAbs_Cylinder:
-        axis = adaptor.Cylinder().Axis()
-    elif surface_type == GeomAbs_Cone:
-        axis = adaptor.Cone().Axis()
-    else:
-        raise ValueError("Tipo de superfície não suportado em axis_key")
-    loc = axis.Location()
-    dir = axis.Direction()
-    # Arredonda para tolerância especificada
-    return (
-        round(loc.X() / loc_tol) * loc_tol,
-        round(loc.Y() / loc_tol) * loc_tol,
-        round(loc.Z() / loc_tol) * loc_tol,
-        round(dir.X() / dir_tol) * dir_tol,
-        round(dir.Y() / dir_tol) * dir_tol,
-        round(dir.Z() / dir_tol) * dir_tol,
-    )
-
-# Função para identificar se o furo atravessa a peça
-def is_hole_through(faces, shape, tol=2.0):
-    """
-    Verifica se pelo menos um vértice de qualquer face do grupo toca uma face extrema do bounding box,
-    E pelo menos um vértice toca a outra face extrema (ou seja, o furo é passante).
-    """
-    if not shape or shape.IsNull():
-        raise ValueError("Shape inválido recebido em is_hole_through.")
-    bbox = Bnd_Box()
-    brepbndlib.Add(shape, bbox)
-    bounds = bbox.Get()
-    faces_touched = set()
-
-    for _, face, _ in faces:
-        vertex_explorer = TopExp_Explorer(face, TopAbs_VERTEX)
-        while vertex_explorer.More():
-            vertex = vertex_explorer.Current()
-            pnt = BRep_Tool.Pnt(vertex)
-            touched = get_bbox_faces_touched(pnt, bounds, tol)
-            faces_touched.update(touched)
-            vertex_explorer.Next()
-    axis_pairs = [('xmin','xmax'), ('ymin','ymax'), ('zmin','zmax')]
-    for a, b in axis_pairs:
-        if a in faces_touched and b in faces_touched:
-            return True
-    return False
-
-# === utils para main_details.py ===
-
-def extract_from_filename(filepath):
-    base = os.path.basename(filepath)
-    name, _ = os.path.splitext(base)
-    parts = re.split(r"[_\-]", name)
-    if len(parts) >= 2:
-        return parts[-2], parts[-1]
-    return None, None
+# ==================================================== Main Details ====================================================
 
 def extract_mold_and_part_from_step(filepath):
     file_mold, file_part = extract_from_filename(filepath)
@@ -126,394 +54,28 @@ def extract_mold_and_part_from_step(filepath):
         return product_mold, product_part
     return None, None
 
-def detect_positions_from_holes(axis_groups, shape):
+# ***************************************** extract_mold_and_part_from_step ****************************************
+
+def extract_from_filename(filepath):
+    base = os.path.basename(filepath)
+    name, _ = os.path.splitext(base)
+    parts = re.split(r"[_\-]", name)
+    if len(parts) >= 2:
+        return parts[-2], parts[-1]
+    return None, None
+
+# ******************************************************************************************************************
+
+def get_bbox(shape_or_face):
     """
-    Detecta o número de posições necessárias para maquinar os furos:
-    - 1 posição: todos passantes ou todos do mesmo lado
-    - 2 posições: há cones/furos sem fundo em direções opostas
+    Retorna a bounding box de uma shape ou face: (xmin, ymin, zmin, xmax, ymax, zmax)
     """
-    has_cone_up = False
-    has_cone_down = False
-    deep_blind_hole = False
+    from OCC.Core.Bnd import Bnd_Box
+    from OCC.Core.BRepBndLib import brepbndlib
 
-    for faces in axis_groups:
-        # ❗️Ignorar grupos passantes
-        if is_hole_through(faces, shape):
-            continue
-
-        for stype, face, adaptor in faces:
-            if stype == GeomAbs_Cone:
-                dir_z = adaptor.Cone().Axis().Direction().Z()
-                if dir_z > 0.5:
-                    has_cone_up = True
-                elif dir_z < -0.5:
-                    has_cone_down = True
-            elif stype == GeomAbs_Cylinder:
-                # Verifica profundidade da face (para detectar furos cegos profundos)
-                bbox = Bnd_Box()
-                brepbndlib.Add(face, bbox)
-                _, _, zmin, _, _, zmax = bbox.Get()
-                depth = abs(zmax - zmin)
-                # Apenas considera como furo cego profundo se tiver mais de 90% da espessura
-                shape_bbox = Bnd_Box()
-                brepbndlib.Add(shape, shape_bbox)
-                _, _, szmin, _, _, szmax = shape_bbox.Get()
-                thickness = abs(szmax - szmin)
-                if depth > 0.9 * thickness:
-                    deep_blind_hole = True
-
-    # Avaliação final
-    if (has_cone_up and has_cone_down):
-        return 2
-    if deep_blind_hole and (has_cone_up or has_cone_down):
-        return 2
-    if has_cone_up or has_cone_down or deep_blind_hole:
-        return 1
-    return 1  # Todos os furos eram passantes
-
-# === utils para cylindrical_details.py ===
-
-def group_faces_by_axis(shape):
-    explorer = TopExp_Explorer(shape, TopAbs_FACE)
-    axis_groups = defaultdict(list)
-    while explorer.More():
-        face = explorer.Current()
-        surface = BRep_Tool.Surface(face)
-        adaptor = GeomAdaptor_Surface(surface)
-        surface_type = adaptor.GetType()
-        if surface_type == GeomAbs_Cylinder:
-            key = axis_key(adaptor)
-            axis_groups[key].append((surface_type, face, adaptor))
-        explorer.Next()
-    return list(axis_groups.values())
-
-def get_min_max_cylindrical_diameter(shape):
-    min_d = None
-    max_d = None
-    axis_groups = group_faces_by_axis(shape)
-    for faces in axis_groups:
-        only_cylinders = all(stype == GeomAbs_Cylinder for stype, _, _ in faces)
-        if only_cylinders:
-            for stype, face, adaptor in faces:
-                d = adaptor.Cylinder().Radius() * 2
-                if (min_d is None) or (d < min_d):
-                    min_d = d
-                if (max_d is None) or (d > max_d):
-                    max_d = d
-    if min_d is not None and max_d is not None:
-        return round(min_d, 2), round(max_d, 2)
-    else:
-        return None, None
-
-def get_group_diameters(faces):
-    diams = []
-    for surface_type, face, adaptor in faces:
-        if surface_type == GeomAbs_Cylinder:
-            diams.append(round(adaptor.Cylinder().Radius() * 2, 2))
-        elif surface_type == GeomAbs_Cone:
-            base = round(adaptor.Cone().RefRadius() * 2, 2)
-            diams.append(base)
-    if not diams:
-        return None, None
-    return min(diams), max(diams)
-
-def classify_hole_group_type(faces):
-    types = set()
-    for stype, _, _ in faces:
-        if stype == GeomAbs_Cylinder:
-            types.add("cilíndrico")
-        elif stype == GeomAbs_Cone:
-            types.add("cónico")
-    if types == {"cilíndrico"}:
-        return "cilíndrico"
-    elif types == {"cónico"}:
-        return "cónico"
-    elif types == {"cilíndrico", "cónico"}:
-        return "misto"
-    else:
-        return "desconhecido"
-    
-def get_circular_hole_diameters_by_type(shape):
-    """
-    Devolve uma lista [(min_d, max_d, tipo), ...] para furos passantes e fechados.
-    Cada grupo representa 1 furo real (pode ser misto cone/cilindro/cilindro+cone+cilindro).
-    """
-
-    loc_tol = get_auto_loc_tol(shape)
-    hole_groups = group_faces_by_axis_and_proximity(shape, loc_tol=loc_tol)
-
-    
-    # --- BLOCO DE DEBUG ---
-    #for i, group in enumerate(hole_groups):
-    #    print(f"Grupo {i}: {len(group)} faces")
-    #    print("Tipos:", [classify_hole_group_type([face]) for face in group])
-    # -----------------------
-
-    diameters_through = []
-    diameters_closed = []
-
-    for faces in hole_groups:
-        radii, _ = get_all_radii_of_group(faces)
-        if not radii:
-            continue
-        min_d = round(min(radii) * 2, 2)
-        max_d = round(max(radii) * 2, 2)
-        tipo = classify_hole_group_type(faces)
-        result = is_hole_through(faces, shape)
-        data = (min_d, max_d, tipo)
-        if result:
-            diameters_through.append(data)
-        else:
-            diameters_closed.append(data)
-    return diameters_through, diameters_closed
-
-def get_all_radii_of_group(faces, min_allowed=3.0):
-    """
-    Retorna todos os raios (em mm) de todas as faces do grupo.
-    Para cones, calcula sempre o raio nos dois extremos da face (base e topo).
-    """
-    import math
-    from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone
-
-    radii = []
-    has_cone = False
-    for stype, face, adaptor in faces:
-        if stype == GeomAbs_Cylinder:
-            r = adaptor.Cylinder().Radius()
-            if r >= min_allowed:
-                radii.append(r)
-        elif stype == GeomAbs_Cone:
-            has_cone = True
-            cone = adaptor.Cone()
-            ref_radius = cone.RefRadius()
-            semi_angle = cone.SemiAngle()
-            axis = cone.Axis()
-            axis_loc = axis.Location()
-            axis_dir = axis.Direction()
-            zs = []
-            for pnt in get_all_vertices_of_group([face]):
-                v = pnt.XYZ() - axis_loc.XYZ()
-                z_rel = v.Dot(axis_dir.XYZ())
-                zs.append(z_rel)
-            if zs:
-                z_min = min(zs)
-                z_max = max(zs)
-                r_min = abs(ref_radius + z_min * math.tan(semi_angle))
-                r_max = abs(ref_radius + z_max * math.tan(semi_angle))
-                if r_min >= min_allowed:
-                    radii.append(r_min)
-                if r_max >= min_allowed:
-                    radii.append(r_max)
-            else:
-                for dz in [-10, 10]:
-                    radius = abs(ref_radius + dz * math.tan(semi_angle))
-                    if radius >= min_allowed:
-                        radii.append(radius)
-    radii = sorted(set(round(r, 2) for r in radii))
-    return radii, has_cone
-
-def is_face_circular_complete(face, tol=0.20):
-    """
-    Verifica se uma face cilíndrica/plana circular é uma circunferência completa ou um arco/parcial.
-    """
-    from OCC.Core.BRepTools import breptools
-    from OCC.Core.TopExp import TopExp_Explorer
-    from OCC.Core.TopAbs import TopAbs_VERTEX, TopAbs_EDGE
-    from OCC.Core.BRep import BRep_Tool
-    import math
-
-    outer_wire = breptools.OuterWire(face)
-    edge_explorer = TopExp_Explorer(outer_wire, TopAbs_EDGE)
-    edge_lengths = []
-    while edge_explorer.More():
-        edge = edge_explorer.Current()
-        curve_handle, first, last = BRep_Tool.Curve(edge)
-        length = abs(last - first)
-        edge_lengths.append(length)
-        edge_explorer.Next()
-    if not edge_lengths:
-        return False
-    total_length = sum(edge_lengths)
-
-    from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
-    from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Plane
-    adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
-    surface_type = adaptor.GetType()
-    if surface_type == GeomAbs_Cylinder:
-        radius = adaptor.Cylinder().Radius()
-    elif surface_type == GeomAbs_Plane:
-        vertex_explorer = TopExp_Explorer(outer_wire, TopAbs_VERTEX)
-        vertices = []
-        while vertex_explorer.More():
-            v = BRep_Tool.Pnt(vertex_explorer.Current())
-            vertices.append((v.X(), v.Y(), v.Z()))
-            vertex_explorer.Next()
-        if len(vertices) < 3:
-            return False
-        cx = sum(x for x, y, z in vertices) / len(vertices)
-        cy = sum(y for x, y, z in vertices) / len(vertices)
-        cz = sum(z for x, y, z in vertices) / len(vertices)
-        radius = sum(math.sqrt((x-cx)**2 + (y-cy)**2 + (z-cz)**2) for x, y, z in vertices) / len(vertices)
-    else:
-        return False
-
-    full_perimeter = 2 * math.pi * radius
-
-    percent = total_length / full_perimeter
-    # Usar tolerância mais conservadora (20% de diferença)
-    if percent >= (1 - tol):
-        return True
-    return False
-    
-def is_face_half_circle(face, piece_bbox=None, tol=0.15, lateral_tol=10.0, min_arc_ratio=0.4):
-    """
-    Deteta se a face é semicircular (meia-lua) próxima da lateral.
-    - min_arc_ratio: percentagem mínima do wire que deve ser arco.
-    """
-    from OCC.Core.BRepTools import breptools
-    from OCC.Core.TopExp import TopExp_Explorer
-    from OCC.Core.TopAbs import TopAbs_VERTEX, TopAbs_EDGE
-    from OCC.Core.BRep import BRep_Tool
-    from OCC.Core.GeomAdaptor import GeomAdaptor_Curve
-    from OCC.Core.GeomAbs import GeomAbs_Circle
-    import math
-
-    outer_wire = breptools.OuterWire(face)
-
-    # 1. Coleta vértices e comprimento total do wire
-    edge_explorer = TopExp_Explorer(outer_wire, TopAbs_EDGE)
-    total_length = 0
-    arc_length = 0
-    edge_count = 0
-    has_arc = False
-
-    while edge_explorer.More():
-        edge = edge_explorer.Current()
-        curve_handle, first, last = BRep_Tool.Curve(edge)
-        length = abs(last - first)
-        total_length += length
-
-        adaptor = GeomAdaptor_Curve(curve_handle, first, last)
-        if adaptor.GetType() == GeomAbs_Circle:
-            arc_length += length
-            has_arc = True
-
-        edge_count += 1
-        edge_explorer.Next()
-
-    if not has_arc or edge_count < 4:
-        return False
-
-    arc_ratio = arc_length / total_length if total_length > 0 else 0
-    if arc_ratio < min_arc_ratio:
-        return False
-
-    # 2. Calcula centroide e raio médio
-    vertex_explorer = TopExp_Explorer(outer_wire, TopAbs_VERTEX)
-    vertices = []
-    while vertex_explorer.More():
-        v = BRep_Tool.Pnt(vertex_explorer.Current())
-        vertices.append((v.X(), v.Y(), v.Z()))
-        vertex_explorer.Next()
-    if len(vertices) < 4:
-        return False
-
-    cx = sum(x for x, y, z in vertices) / len(vertices)
-    cy = sum(y for x, y, z in vertices) / len(vertices)
-    cz = sum(z for x, y, z in vertices) / len(vertices)
-    radius = sum(math.sqrt((x-cx)**2 + (y-cy)**2 + (z-cz)**2) for x, y, z in vertices) / len(vertices)
-
-    half_perimeter = math.pi * radius
-
-    # 3. Wire deve ser próximo de meia circunferência
-    if abs(total_length - half_perimeter) / half_perimeter < tol:
-        if piece_bbox is not None:
-            xmin, ymin, zmin, xmax, ymax, zmax = piece_bbox
-            close_to_side = (
-                abs(cx - xmin) < lateral_tol or
-                abs(cx - xmax) < lateral_tol or
-                abs(cy - ymin) < lateral_tol or
-                abs(cy - ymax) < lateral_tol
-            )
-            if not close_to_side:
-                return False
-        return True
-
-    return False
-
-# === utils para rectangular_details.py ===
-
-def get_face_area(face):
-    """Retorna a área de uma face."""
-    props = GProp_GProps()
-    brepgprop.SurfaceProperties(face, props)  # <-- método correto e sem warning
-    return props.Mass()
-
-def is_circular_face(face, tol=0.5):
-    """
-    Verifica se uma face plana é circular.
-    """
-    outer_wire = breptools.OuterWire(face)
-    vertex_explorer = TopExp_Explorer(outer_wire, TopAbs_VERTEX)
-    vertices = []
-    while vertex_explorer.More():
-        vertex = topods.Vertex(vertex_explorer.Current())
-        pnt = BRep_Tool.Pnt(vertex)
-        vertices.append((pnt.X(), pnt.Y(), pnt.Z()))
-        vertex_explorer.Next()
-    if len(vertices) < 5:
-        return False
-    cx = sum(v[0] for v in vertices) / len(vertices)
-    cy = sum(v[1] for v in vertices) / len(vertices)
-    cz = sum(v[2] for v in vertices) / len(vertices)
-    radii = [math.sqrt((v[0] - cx) ** 2 + (v[1] - cy) ** 2 + (v[2] - cz) ** 2) for v in vertices]
-    avg_radius = sum(radii) / len(radii)
-    if all(abs(r - avg_radius) < tol for r in radii):
-        return True
-    return False
-
-def group_non_circular_planar_faces(shape):
-    """
-    Retorna todas as faces planas não circulares, excluindo a maior (face exterior).
-    """
-    faces = []
-    explorer = TopExp_Explorer(shape, TopAbs_FACE)
-    while explorer.More():
-        face = topods.Face(explorer.Current())
-        adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
-        if adaptor.GetType() == GeomAbs_Plane:
-            if not is_circular_face(face):
-                faces.append(face)
-        explorer.Next()
-    faces_with_area = [(face, get_face_area(face)) for face in faces]
-    if not faces_with_area:
-        return []
-    # Remove as faces exteriores (maiores áreas)
-    faces_with_area.sort(key=lambda x: x[1], reverse=True)
-    max_area = faces_with_area[0][1]
-    area_tol = 1.0
-    filtered_faces = [f for f, a in faces_with_area if abs(a - max_area) > area_tol]
-    return filtered_faces
-
-def classify_rectangular_face(face, tol=1.0):
-    """
-    Classifica uma face plana não circular como quadrada ou retangular, devolvendo as medidas principais.
-    """
-    if not isinstance(face, TopoDS_Face):
-        try:
-            face = topods.Face(face)
-        except Exception as e:
-            raise ValueError("Could not convert face to TopoDS_Face") from e
     bbox = Bnd_Box()
-    brepbndlib.Add(face, bbox)
-    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-    dx = abs(xmax - xmin)
-    dy = abs(ymax - ymin)
-    dz = abs(zmax - zmin)
-    sides = sorted([dx, dy, dz], reverse=True)
-    length, width = round(sides[0], 2), round(sides[1], 2)
-    shape_type = "square" if abs(width - length) <= tol else "rectangular"
-    return shape_type, length, width
+    brepbndlib.Add(shape_or_face, bbox)
+    return bbox.Get()
 
 def get_piece_dimensions(shape):
     """
@@ -530,348 +92,21 @@ def get_piece_dimensions(shape):
     width = round(min(dx, dy), 2)
     return length, width
 
-def auto_filter_rectangular_faces(faces, width_min_abs=0.5, width_percentile=20):
-    """
-    Recebe lista de faces não circulares, remove as com largura quase nula
-    e retorna apenas as 'verdadeiras' baseando-se no percentil das larguras.
-    """
-    # Extrai todas as larguras e classificações
-    measures = []
-    for face in faces:
-        shape_type, length, width = classify_rectangular_face(face)
-        measures.append((face, shape_type, length, width))
-
-    # Filtra larguras quase nulas (degraus/chanfros)
-    filtered = [t for t in measures if t[3] > width_min_abs]
-    if not filtered:
-        return []
-
-    # Extrai só as larguras válidas
-    all_widths = [t[3] for t in filtered]
-    # Calcula o valor do percentil (por ex: elimina os 20% mais pequenos)
-    threshold = np.percentile(all_widths, width_percentile)
-    # Só aceita as larguras acima do percentil
-    final = [t for t in filtered if t[3] > threshold]
-    return final
-
-# Funções Utilitárias Adaptadas
-
-def get_cylindrical_faces(shape, min_radius=2.0, max_radius=30.0):
-    """
-    Retorna todas as faces cilíndricas no shape dentro do intervalo de raio.
-    """
-    faces = []
-    explorer = TopExp_Explorer(shape, TopAbs_FACE)
-    while explorer.More():
-        face = topods.Face(explorer.Current())
-        adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
-        if adaptor.GetType() == GeomAbs_Cylinder:
-            cyl = adaptor.Cylinder()
-            radius = cyl.Radius()
-            if min_radius <= radius <= max_radius:
-                faces.append((face, cyl))
-        explorer.Next()
-    return faces
-
-def are_cylinders_parallel(cyl1, cyl2, angle_tol=0.05):
-    """
-    Verifica se os eixos de dois cilindros são paralelos.
-    """
-    dir1 = cyl1.Axis().Direction()
-    dir2 = cyl2.Axis().Direction()
-    dot = dir1.Dot(dir2)
-    # Ângulo próximo de 0° ou 180°
-    return abs(abs(dot) - 1.0) < angle_tol
-
-def distance_between_axes(cyl1, cyl2, tol=1e-7):
-    p1 = cyl1.Axis().Location()
-    d1 = cyl1.Axis().Direction()
-    p2 = cyl2.Axis().Location()
-    d2 = cyl2.Axis().Direction()
-    v = gp_Vec(p1, p2)
-    dot = abs(d1.Dot(d2))
-    if abs(dot - 1.0) < tol:
-        # Eixos paralelos: distância perpendicular
-        return v.Crossed(gp_Vec(d1)).Magnitude() / gp_Vec(d1).Magnitude()
-
-    # Só aqui faz Crossed (não paralelos)
-    n = d1.Crossed(d2)
-    normalized_n = gp_Vec(n.XYZ().Normalized())
-    return abs(v.Dot(normalized_n))
-
-def get_face_area(face):
-    """
-    Retorna a área de uma face.
-    """
-    props = GProp_GProps()
-    brepgprop.SurfaceProperties(face, props)
-    return props.Mass()
-
-# Função principal de slots
-
-def find_slots(shape):
-    """
-    Procura grupos de 2 cilindros paralelos + faces planas laterais (slots).
-    Retorna lista de slots: (comprimento, largura, centro, orientação).
-    """
-    cylindrical_faces = get_cylindrical_faces(shape)
-    slots = []
-    # Testa todos os pares de cilindros paralelos com mesmo raio
-    for i, (face1, cyl1) in enumerate(cylindrical_faces):
-        for j, (face2, cyl2) in enumerate(cylindrical_faces):
-            if i >= j:
-                continue
-            if abs(cyl1.Radius() - cyl2.Radius()) > 0.5:
-                continue
-            if not are_cylinders_parallel(cyl1, cyl2):
-                continue
-            dist = distance_between_axes(cyl1, cyl2)
-            # Só considera slots plausíveis (distância realista entre eixos)
-            if dist < 10.0 or dist > 2000.0: # ajusta para o teu caso
-                continue
-            largura = round(2 * cyl1.Radius(), 2)
-            comprimento = round(dist + 2 * cyl1.Radius(), 2)
-            # Opcional: verifica se há faces planas paralelas com estas dimensões entre os cilindros
-            slots.append((comprimento, largura))
-    return slots
-
-def get_bbox(shape_or_face):
-    """
-    Retorna a bounding box de uma shape ou face: (xmin, ymin, zmin, xmax, ymax, zmax)
-    """
-    from OCC.Core.Bnd import Bnd_Box
-    from OCC.Core.BRepBndLib import brepbndlib
-
+def get_auto_loc_tol(shape):
     bbox = Bnd_Box()
-    brepbndlib.Add(shape_or_face, bbox)
-    return bbox.Get()
+    brepbndlib.Add(shape, bbox)
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+    max_dim = max(abs(xmax - xmin), abs(ymax - ymin), abs(zmax - zmin))
+    # Ajusta conforme os teus requisitos e experiência
+    if max_dim < 200:
+        return 2.0
+    elif max_dim < 500:
+        return 5.0
+    else:
+        return 10.0
 
-def is_open_edge(face, piece_bbox, tol=2.0):
-    """
-    Verifica se pelo menos um lado da face coincide com um dos limites globais da peça.
-    Considera 'slot aberto' se apenas UM lado tocar a borda da peça.
-    """
-    xmin_p, ymin_p, zmin_p, xmax_p, ymax_p, zmax_p = piece_bbox
-    xmin, ymin, zmin, xmax, ymax, zmax = get_bbox(face)
-    hits = [
-        abs(xmin - xmin_p) < tol,
-        abs(xmax - xmax_p) < tol,
-        abs(ymin - ymin_p) < tol,
-        abs(ymax - ymax_p) < tol,
-    ]
-    return sum(hits) == 1
-
-# === teste para visualizar todos os retangulos ===
-
-def group_all_planar_faces(shape):
-    """
-    Retorna uma lista de todas as faces planas da chapa.
-    """
-    faces = []
-    explorer = TopExp_Explorer(shape, TopAbs_FACE)
-    while explorer.More():
-        face = topods.Face(explorer.Current())
-        adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
-        if adaptor.GetType() == GeomAbs_Plane:
-            faces.append(face)
-        explorer.Next()
-    return faces
-
-# === utils para semi_circular_details.py ===
-
-def collect_circular_holes(shape, tol=1.0):
-    """
-    Recolhe todos os furos circulares completos da peça, agrupando por centro e raio (tolerância).
-    Retorna uma lista de tuplos: (centro_x, centro_y, centro_z, raio)
-    """
-    from OCC.Core.BRep import BRep_Tool
-    from OCC.Core.TopExp import TopExp_Explorer
-    from OCC.Core.TopAbs import TopAbs_FACE
-    from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
-    from OCC.Core.GeomAbs import GeomAbs_Cylinder
-    import math
-
-    groups = []
-    explorer = TopExp_Explorer(shape, TopAbs_FACE)
-    while explorer.More():
-        face = explorer.Current()
-        adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
-        if adaptor.GetType() == GeomAbs_Cylinder:
-            cyl = adaptor.Cylinder()
-            x, y, z = cyl.Axis().Location().X(), cyl.Axis().Location().Y(), cyl.Axis().Location().Z()
-            r = cyl.Radius()
-            # Agrupa por centro e raio
-            found = False
-            for g in groups:
-                gx, gy, gz, gr = g
-                if (abs(gx-x) < tol and abs(gy-y) < tol and abs(gz-z) < tol and abs(gr-r) < tol):
-                    found = True
-                    break
-            if not found:
-                groups.append((x, y, z, r))
-        explorer.Next()
-    return groups
-
-def collect_semi_circular_arcs(shape, lateral_tol=3.0, angle_tol=30.0, radius_tol=1.0):
-    """
-    Recolhe todos os recortes semicirculares (arcos ~180º perto da lateral) e devolve lista de dicts:
-    {'center': (x, y, z), 'radius': r, 'angle': angle}
-    """
-    from OCC.Core.BRep import BRep_Tool
-    from OCC.Core.TopExp import TopExp_Explorer
-    from OCC.Core.TopAbs import TopAbs_EDGE
-    from OCC.Core.GeomAdaptor import GeomAdaptor_Curve
-    from OCC.Core.GeomAbs import GeomAbs_Circle
-    import math
-
-    results = []
-    piece_bbox = get_bbox(shape)
-    explorer = TopExp_Explorer(shape, TopAbs_EDGE)
-    while explorer.More():
-        edge = explorer.Current()
-        curve_data = BRep_Tool.Curve(edge)
-        if not curve_data or len(curve_data) < 3:
-            explorer.Next()
-            continue
-        curve_handle, first, last = curve_data
-        adaptor = GeomAdaptor_Curve(curve_handle, first, last)
-        if adaptor.GetType() == GeomAbs_Circle:
-            circ = adaptor.Circle()
-            center = circ.Location()
-            r = circ.Radius()
-            angle = abs(math.degrees(last - first))
-            # Só arcos semicirculares (aprox 180º)
-            if 180 - angle_tol <= angle <= 180 + angle_tol:
-                x, y, z = center.X(), center.Y(), center.Z()
-                xmin, ymin, zmin, xmax, ymax, zmax = piece_bbox
-                near_lateral = (
-                    abs(x - xmin) < lateral_tol or abs(x - xmax) < lateral_tol or
-                    abs(y - ymin) < lateral_tol or abs(y - ymax) < lateral_tol
-                )
-                if near_lateral:
-                    # Não duplica semicirculo já existente
-                    found = False
-                    for rec in results:
-                        rx, ry, rz = rec['center']
-                        rr = rec['radius']
-                        if (abs(rx-x) < radius_tol and abs(ry-y) < radius_tol and abs(rz-z) < radius_tol and abs(rr-r) < radius_tol):
-                            found = True
-                            break
-                    if not found:
-                        results.append({'center': (x, y, z), 'radius': r, 'angle': angle})
-        explorer.Next()
-    return results
-
-def group_diameters_by_tolerance(diameters, tolerance=2.0):
-    """
-    Agrupa pares de (min_d, max_d) por tolerância, para evitar entradas muito próximas separadas.
-    """
-    grouped = {}
-    for dtuple in diameters:
-        if isinstance(dtuple, (tuple, list)) and len(dtuple) == 2:
-            min_d, max_d = dtuple
-        else:
-            min_d = max_d = dtuple
-
-        found = False
-        for key in grouped:
-            kmin, kmax = key
-            # Se os diâmetros forem semelhantes, agrupa
-            if abs(kmin - min_d) < tolerance and abs(kmax - max_d) < tolerance:
-                grouped[key] += 1
-                found = True
-                break
-
-        if not found:
-            grouped[(min_d, max_d)] = 1
-
-    return Counter(grouped)
-
-def group_holes_by_center(features, center_tol=3.0):
-    """
-    Agrupa furos (circulares e semicirculares) com base na proximidade do centro (x, y)
-    e calcula o min/max diâmetro de cada grupo. Evita duplicados.
-    """
-    grouped_by_center = []
-
-    for feat in features:
-        cx, cy = feat['center']
-        min_d, max_d = feat['min_d'], feat['max_d']
-        added = False
-
-        for group in grouped_by_center:
-            gx, gy = group['center']
-            if abs(cx - gx) < center_tol and abs(cy - gy) < center_tol:
-                group['min_d'] = min(group['min_d'], min_d)
-                group['max_d'] = max(group['max_d'], max_d)
-                group['count'] += 1
-                added = True
-                break
-
-        if not added:
-            grouped_by_center.append({
-                'center': (cx, cy),
-                'min_d': min_d,
-                'max_d': max_d,
-                'count': 1
-            })
-
-    # Reorganiza os grupos para mostrar no resumo
-    all_counter = Counter()
-    for group in grouped_by_center:
-        key = (round(group['min_d'], 1), round(group['max_d'], 1))
-        all_counter[key] += 1
-
-    return all_counter
-
-def group_semi_circular_arcs(arcs, group_tol=3.0):
-    """
-    Agrupa arcos semicirculares por centro X/Y (não por Z), tolerância em mm.
-    """
-    grouped = []
-    for arc in arcs:
-        x, y, z = arc['center']
-        r = arc['radius']
-        found = False
-        for g in grouped:
-            gx, gy = g['xy']
-            if abs(x - gx) < group_tol and abs(y - gy) < group_tol:
-                g['zs'].append(z)
-                g['radii'].append(r)
-                g['angles'].append(arc['angle'])
-                found = True
-                break
-        if not found:
-            grouped.append({
-                'xy': (x, y),
-                'zs': [z],
-                'radii': [r],
-                'angles': [arc['angle']]
-            })
-    return grouped
-
-# === utils auxiliares (usados em várias partes) ===
-
-def get_all_vertices_of_group(faces):
-    vertices = []
-    for face in faces:
-        explorer = TopExp_Explorer(face, TopAbs_VERTEX)
-        while explorer.More():
-            v = explorer.Current()
-            vertices.append(BRep_Tool.Pnt(v))
-            explorer.Next()
-    return vertices
-
-def get_bbox_faces_touched(pnt, bbox, tol=0.5):
-    xmin, ymin, zmin, xmax, ymax, zmax = bbox
-    faces = []
-    if abs(pnt.X() - xmin) < tol: faces.append("xmin")
-    if abs(pnt.X() - xmax) < tol: faces.append("xmax")
-    if abs(pnt.Y() - ymin) < tol: faces.append("ymin")
-    if abs(pnt.Y() - ymax) < tol: faces.append("ymax")
-    if abs(pnt.Z() - zmin) < tol: faces.append("zmin")
-    if abs(pnt.Z() - zmax) < tol: faces.append("zmax")
-    return faces
+# -------------------------------------------------------------------------------------------------------------------
+# ------------------------------------------------ Circular Details -------------------------------------------------
 
 def group_faces_by_axis_and_proximity(shape, loc_tol=2.0, dir_tol=0.05):
     """
@@ -932,35 +167,609 @@ def group_faces_by_axis_and_proximity(shape, loc_tol=2.0, dir_tol=0.05):
         groups.append([(item['stype'], item['face'], item['adaptor']) for item in group])
     return groups
 
-def get_auto_loc_tol(shape):
+def get_all_radii_of_group(faces, min_allowed=3.0):
+    """
+    Retorna todos os raios (em mm) de todas as faces do grupo.
+    Para cones, calcula sempre o raio nos dois extremos da face (base e topo).
+    """
+    import math
+    from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone
+
+    radii = []
+    has_cone = False
+    for stype, face, adaptor in faces:
+        if stype == GeomAbs_Cylinder:
+            r = adaptor.Cylinder().Radius()
+            if r >= min_allowed:
+                radii.append(r)
+        elif stype == GeomAbs_Cone:
+            has_cone = True
+            cone = adaptor.Cone()
+            ref_radius = cone.RefRadius()
+            semi_angle = cone.SemiAngle()
+            axis = cone.Axis()
+            axis_loc = axis.Location()
+            axis_dir = axis.Direction()
+            zs = []
+            for pnt in get_all_vertices_of_group([face]):
+                v = pnt.XYZ() - axis_loc.XYZ()
+                z_rel = v.Dot(axis_dir.XYZ())
+                zs.append(z_rel)
+            if zs:
+                z_min = min(zs)
+                z_max = max(zs)
+                r_min = abs(ref_radius + z_min * math.tan(semi_angle))
+                r_max = abs(ref_radius + z_max * math.tan(semi_angle))
+                if r_min >= min_allowed:
+                    radii.append(r_min)
+                if r_max >= min_allowed:
+                    radii.append(r_max)
+            else:
+                for dz in [-10, 10]:
+                    radius = abs(ref_radius + dz * math.tan(semi_angle))
+                    if radius >= min_allowed:
+                        radii.append(radius)
+    radii = sorted(set(round(r, 2) for r in radii))
+    return radii, has_cone
+
+# ******************************************** get_all_radii_of_group **********************************************
+
+def get_all_vertices_of_group(faces):
+    vertices = []
+    for face in faces:
+        explorer = TopExp_Explorer(face, TopAbs_VERTEX)
+        while explorer.More():
+            v = explorer.Current()
+            vertices.append(BRep_Tool.Pnt(v))
+            explorer.Next()
+    return vertices
+
+# ******************************************************************************************************************
+
+def detect_positions_from_holes(axis_groups, shape):
+    
+    """
+    Só considera grupos com pelo menos um cilindro (furos reais) para a lógica de posições.
+    Ignora grupos só de cones (chanfros/cabeças de embutir).
+    Retorna 2 posições se houver furos com fundo (não passantes) em direções opostas.
+    Furos passantes são ignorados.
+    """
+    has_up = False
+    has_down = False
+    from OCC.Core.GeomAbs import GeomAbs_Cylinder
+    from OCC.Core.Bnd import Bnd_Box
+    from OCC.Core.BRepBndLib import brepbndlib
+    for i, faces in enumerate(axis_groups):
+        if is_hole_through(faces, shape):
+            # print(f"Grupo {i}: passante")
+            continue
+        # Só considera grupos com pelo menos um cilindro
+        has_cylinder = any(stype == GeomAbs_Cylinder for stype, _, _ in faces)
+        if not has_cylinder:
+            # print(f"Grupo {i}: ignorado (só cone)")
+            continue
+        # Calcula direção e profundidade do cilindro principal
+        for stype, face, adaptor in faces:
+            if stype == GeomAbs_Cylinder:
+                dir_z = adaptor.Cylinder().Axis().Direction().Z()
+                # Calcula profundidade
+                bbox = Bnd_Box()
+                brepbndlib.Add(face, bbox)
+                _, _, zmin, _, _, zmax = bbox.Get()
+                depth = abs(zmax - zmin)
+                # Considera só se profundidade for relevante (>2mm)
+                if depth < 2.0:
+                    continue
+                if dir_z > 0.5:
+                    has_up = True
+                elif dir_z < -0.5:
+                    has_down = True
+                break
+    if has_up and has_down:
+        return 2
+    return 1
+
+'''
+# ----------------------- Older Version ----------------------
+def detect_positions_from_holes(axis_groups, shape):
+    """
+    Detecta o número de posições necessárias para maquinar os furos:
+    - 1 posição: todos passantes ou todos do mesmo lado
+    - 2 posições: há cones/furos sem fundo em direções opostas
+    """
+    has_cone_up = False
+    has_cone_down = False
+    deep_blind_hole = False
+
+    for faces in axis_groups:
+        # Ignorar grupos passantes
+        if is_hole_through(faces, shape):
+            continue
+
+        for stype, face, adaptor in faces:
+            if stype == GeomAbs_Cone:
+                dir_z = adaptor.Cone().Axis().Direction().Z()
+                if dir_z > 0.5:
+                    has_cone_up = True
+                elif dir_z < -0.5:
+                    has_cone_down = True
+            elif stype == GeomAbs_Cylinder:
+                # Verifica profundidade da face (para detectar furos cegos profundos)
+                bbox = Bnd_Box()
+                brepbndlib.Add(face, bbox)
+                _, _, zmin, _, _, zmax = bbox.Get()
+                depth = abs(zmax - zmin)
+                # Apenas considera como furo cego profundo se tiver mais de 90% da espessura
+                shape_bbox = Bnd_Box()
+                brepbndlib.Add(shape, shape_bbox)
+                _, _, szmin, _, _, szmax = shape_bbox.Get()
+                thickness = abs(szmax - szmin)
+                if depth > 0.9 * thickness:
+                    deep_blind_hole = True
+
+    # Avaliação final
+    if (has_cone_up and has_cone_down):
+        return 2
+    if deep_blind_hole and (has_cone_up or has_cone_down):
+        return 2
+    if has_cone_up or has_cone_down or deep_blind_hole:
+        return 1
+    return 1  # Todos os furos eram passantes
+# ------------------------------------------------------------
+'''
+
+# ******************************************* detect_positions_from_holes ******************************************
+
+def is_hole_through(faces, shape, tol=2.0):
+    """
+    Verifica se pelo menos um vértice de qualquer face do grupo toca uma face extrema do bounding box,
+    E pelo menos um vértice toca a outra face extrema (ou seja, o furo é passante).
+    """
+    if not shape or shape.IsNull():
+        raise ValueError("Shape inválido recebido em is_hole_through.")
     bbox = Bnd_Box()
     brepbndlib.Add(shape, bbox)
+    bounds = bbox.Get()
+    faces_touched = set()
+
+    for _, face, _ in faces:
+        vertex_explorer = TopExp_Explorer(face, TopAbs_VERTEX)
+        while vertex_explorer.More():
+            vertex = vertex_explorer.Current()
+            pnt = BRep_Tool.Pnt(vertex)
+            touched = get_bbox_faces_touched(pnt, bounds, tol)
+            faces_touched.update(touched)
+            vertex_explorer.Next()
+    axis_pairs = [('xmin','xmax'), ('ymin','ymax'), ('zmin','zmax')]
+    for a, b in axis_pairs:
+        if a in faces_touched and b in faces_touched:
+            return True
+    return False
+
+def get_bbox_faces_touched(pnt, bbox, tol=0.5):
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox
+    faces = []
+    if abs(pnt.X() - xmin) < tol: faces.append("xmin")
+    if abs(pnt.X() - xmax) < tol: faces.append("xmax")
+    if abs(pnt.Y() - ymin) < tol: faces.append("ymin")
+    if abs(pnt.Y() - ymax) < tol: faces.append("ymax")
+    if abs(pnt.Z() - zmin) < tol: faces.append("zmin")
+    if abs(pnt.Z() - zmax) < tol: faces.append("zmax")
+    return faces
+
+# ******************************************************************************************************************
+
+# ----------------------------------------------------------------------------------------------------------------------
+# ------------------------------------------------ Rectangular Details -------------------------------------------------
+
+def find_slots(shape):
+
+    """
+    Procura grupos de 2 cilindros paralelos + faces planas laterais (slots).
+    Retorna lista de slots: (comprimento, largura, centro, orientação).
+    """
+    cylindrical_faces = get_cylindrical_faces(shape)
+    slots = []
+    # Testa todos os pares de cilindros paralelos com mesmo raio
+    for i, (face1, cyl1) in enumerate(cylindrical_faces):
+        for j, (face2, cyl2) in enumerate(cylindrical_faces):
+            if i >= j:
+                continue
+            if abs(cyl1.Radius() - cyl2.Radius()) > 0.5:
+                continue
+            if not are_cylinders_parallel(cyl1, cyl2):
+                continue
+            dist = distance_between_axes(cyl1, cyl2)
+            # Só considera slots plausíveis (distância realista entre eixos)
+            if dist < 10.0 or dist > 2000.0: # ajusta para o teu caso
+                continue
+            largura = round(2 * cyl1.Radius(), 2)
+            comprimento = round(dist + 2 * cyl1.Radius(), 2)
+            # Opcional: verifica se há faces planas paralelas com estas dimensões entre os cilindros
+            slots.append((comprimento, largura))
+    return slots
+# *************************************************** find_slots ***************************************************
+
+def get_cylindrical_faces(shape, min_radius=2.0, max_radius=30.0):
+    """
+    Retorna todas as faces cilíndricas no shape dentro do intervalo de raio.
+    """
+    faces = []
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    while explorer.More():
+        face = topods.Face(explorer.Current())
+        adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
+        if adaptor.GetType() == GeomAbs_Cylinder:
+            cyl = adaptor.Cylinder()
+            radius = cyl.Radius()
+            if min_radius <= radius <= max_radius:
+                faces.append((face, cyl))
+        explorer.Next()
+    return faces
+
+def are_cylinders_parallel(cyl1, cyl2, angle_tol=0.05):
+    """
+    Verifica se os eixos de dois cilindros são paralelos.
+    """
+    dir1 = cyl1.Axis().Direction()
+    dir2 = cyl2.Axis().Direction()
+    dot = dir1.Dot(dir2)
+    # Ângulo próximo de 0° ou 180°
+    return abs(abs(dot) - 1.0) < angle_tol
+
+def distance_between_axes(cyl1, cyl2, tol=1e-7):
+    p1 = cyl1.Axis().Location()
+    d1 = cyl1.Axis().Direction()
+    p2 = cyl2.Axis().Location()
+    d2 = cyl2.Axis().Direction()
+    v = gp_Vec(p1, p2)
+    dot = abs(d1.Dot(d2))
+    if abs(dot - 1.0) < tol:
+        # Eixos paralelos: distância perpendicular
+        return v.Crossed(gp_Vec(d1)).Magnitude() / gp_Vec(d1).Magnitude()
+
+    # Só aqui faz Crossed (não paralelos)
+    n = d1.Crossed(d2)
+    normalized_n = gp_Vec(n.XYZ().Normalized())
+    return abs(v.Dot(normalized_n))
+
+# ******************************************************************************************************************
+# ***************************************** group_non_circular_planar_faces ****************************************
+
+def group_non_circular_planar_faces(shape):
+    """
+    Retorna todas as faces planas não circulares, excluindo a maior (face exterior).
+    """
+    faces = []
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    while explorer.More():
+        face = topods.Face(explorer.Current())
+        adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
+        if adaptor.GetType() == GeomAbs_Plane:
+            if not is_circular_face(face):
+                faces.append(face)
+        explorer.Next()
+    faces_with_area = [(face, get_face_area(face)) for face in faces]
+    if not faces_with_area:
+        return []
+    # Remove as faces exteriores (maiores áreas)
+    faces_with_area.sort(key=lambda x: x[1], reverse=True)
+    max_area = faces_with_area[0][1]
+    area_tol = 1.0
+    filtered_faces = [f for f, a in faces_with_area if abs(a - max_area) > area_tol]
+    return filtered_faces
+
+def is_circular_face(face, tol=0.5):
+    """
+    Verifica se uma face plana é circular.
+    """
+    outer_wire = breptools.OuterWire(face)
+    vertex_explorer = TopExp_Explorer(outer_wire, TopAbs_VERTEX)
+    vertices = []
+    while vertex_explorer.More():
+        vertex = topods.Vertex(vertex_explorer.Current())
+        pnt = BRep_Tool.Pnt(vertex)
+        vertices.append((pnt.X(), pnt.Y(), pnt.Z()))
+        vertex_explorer.Next()
+    if len(vertices) < 5:
+        return False
+    cx = sum(v[0] for v in vertices) / len(vertices)
+    cy = sum(v[1] for v in vertices) / len(vertices)
+    cz = sum(v[2] for v in vertices) / len(vertices)
+    radii = [math.sqrt((v[0] - cx) ** 2 + (v[1] - cy) ** 2 + (v[2] - cz) ** 2) for v in vertices]
+    avg_radius = sum(radii) / len(radii)
+    if all(abs(r - avg_radius) < tol for r in radii):
+        return True
+    return False
+
+# ******************************************************************************************************************
+# ******************************************* auto_filter_rectangular_faces ****************************************
+
+def auto_filter_rectangular_faces(faces, width_min_abs=0.5, width_percentile=20):
+    """
+    Recebe lista de faces não circulares, remove as com largura quase nula
+    e retorna apenas as 'verdadeiras' baseando-se no percentil das larguras.
+    """
+    # Extrai todas as larguras e classificações
+    measures = []
+    for face in faces:
+        shape_type, length, width = classify_rectangular_face(face)
+        measures.append((face, shape_type, length, width))
+
+    # Filtra larguras quase nulas (degraus/chanfros)
+    filtered = [t for t in measures if t[3] > width_min_abs]
+    if not filtered:
+        return []
+
+    # Extrai só as larguras válidas
+    all_widths = [t[3] for t in filtered]
+    # Calcula o valor do percentil (por ex: elimina os 20% mais pequenos)
+    threshold = np.percentile(all_widths, width_percentile)
+    # Só aceita as larguras acima do percentil
+    final = [t for t in filtered if t[3] > threshold]
+    return final
+
+def classify_rectangular_face(face, tol=1.0):
+    """
+    Classifica uma face plana não circular como quadrada ou retangular, devolvendo as medidas principais.
+    """
+    if not isinstance(face, TopoDS_Face):
+        try:
+            face = topods.Face(face)
+        except Exception as e:
+            raise ValueError("Could not convert face to TopoDS_Face") from e
+    bbox = Bnd_Box()
+    brepbndlib.Add(face, bbox)
     xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-    max_dim = max(abs(xmax - xmin), abs(ymax - ymin), abs(zmax - zmin))
-    # Ajusta conforme os teus requisitos e experiência
-    if max_dim < 200:
-        return 2.0
-    elif max_dim < 500:
-        return 5.0
+    dx = abs(xmax - xmin)
+    dy = abs(ymax - ymin)
+    dz = abs(zmax - zmin)
+    sides = sorted([dx, dy, dz], reverse=True)
+    length, width = round(sides[0], 2), round(sides[1], 2)
+    shape_type = "square" if abs(width - length) <= tol else "rectangular"
+    return shape_type, length, width
+
+# ******************************************************************************************************************
+
+def get_face_area(face):
+    """Retorna a área de uma face."""
+    props = GProp_GProps()
+    brepgprop.SurfaceProperties(face, props)
+    return props.Mass()
+
+# ----------------------------------------------------------------------------------------------------------------------
+# --------------------------------------------- Semi-Cylindrical Details -----------------------------------------------
+
+def collect_semi_circular_arcs(shape, lateral_tol=3.0, angle_tol=30.0, radius_tol=1.0):
+    """
+    Recolhe todos os recortes semicirculares (arcos ~180º perto da lateral) e devolve lista de dicts:
+    {'center': (x, y, z), 'radius': r, 'angle': angle}
+    """
+    from OCC.Core.BRep import BRep_Tool
+    from OCC.Core.TopExp import TopExp_Explorer
+    from OCC.Core.TopAbs import TopAbs_EDGE
+    from OCC.Core.GeomAdaptor import GeomAdaptor_Curve
+    from OCC.Core.GeomAbs import GeomAbs_Circle
+    import math
+
+    results = []
+    piece_bbox = get_bbox(shape)
+    explorer = TopExp_Explorer(shape, TopAbs_EDGE)
+    while explorer.More():
+        edge = explorer.Current()
+        curve_data = BRep_Tool.Curve(edge)
+        if not curve_data or len(curve_data) < 3:
+            explorer.Next()
+            continue
+        curve_handle, first, last = curve_data
+        adaptor = GeomAdaptor_Curve(curve_handle, first, last)
+        if adaptor.GetType() == GeomAbs_Circle:
+            circ = adaptor.Circle()
+            center = circ.Location()
+            r = circ.Radius()
+            angle = abs(math.degrees(last - first))
+            # Só arcos semicirculares (aprox 180º)
+            if 180 - angle_tol <= angle <= 180 + angle_tol:
+                x, y, z = center.X(), center.Y(), center.Z()
+                xmin, ymin, zmin, xmax, ymax, zmax = piece_bbox
+                near_lateral = (
+                    abs(x - xmin) < lateral_tol or abs(x - xmax) < lateral_tol or
+                    abs(y - ymin) < lateral_tol or abs(y - ymax) < lateral_tol
+                )
+                if near_lateral:
+                    # Não duplica semicirculo já existente
+                    found = False
+                    for rec in results:
+                        rx, ry, rz = rec['center']
+                        rr = rec['radius']
+                        if (abs(rx-x) < radius_tol and abs(ry-y) < radius_tol and abs(rz-z) < radius_tol and abs(rr-r) < radius_tol):
+                            found = True
+                            break
+                    if not found:
+                        results.append({'center': (x, y, z), 'radius': r, 'angle': angle})
+        explorer.Next()
+    return results
+
+def group_semi_circular_arcs(arcs, group_tol=3.0):
+    """
+    Agrupa arcos semicirculares por centro X/Y (não por Z), tolerância em mm.
+    """
+    grouped = []
+    for arc in arcs:
+        x, y, z = arc['center']
+        r = arc['radius']
+        found = False
+        for g in grouped:
+            gx, gy = g['xy']
+            if abs(x - gx) < group_tol and abs(y - gy) < group_tol:
+                g['zs'].append(z)
+                g['radii'].append(r)
+                g['angles'].append(arc['angle'])
+                found = True
+                break
+        if not found:
+            grouped.append({
+                'xy': (x, y),
+                'zs': [z],
+                'radii': [r],
+                'angles': [arc['angle']]
+            })
+    return grouped
+
+# ----------------------------------------------------------------------------------------------------------------------
+# --------------------------------------------------- Compare Details ------------------------------------------------------
+
+def group_holes_by_center(features, center_tol=3.0, d_tol=1.0):
+
+    """
+    Agrupa furos (circulares e semicirculares) com base na proximidade do centro (x, y)
+    e do diâmetro máximo. Para cada grupo, guarda todos os diâmetros únicos (com tolerância).
+    No resumo, só mostra grupos distintos, sem sobreposição de intervalos.
+    """
+    grouped_by_center = []
+
+    def dist2d(a, b):
+        return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+    for feat in features:
+        cx, cy = feat['center']
+        min_d, max_d = feat['min_d'], feat['max_d']
+        added = False
+        for group in grouped_by_center:
+            gx, gy = group['center']
+            if dist2d((cx, cy), (gx, gy)) < center_tol:
+                # Verifica se já existe diâmetro semelhante neste grupo
+                found = False
+                for d in group['diameters']:
+                    if abs(d - max_d) < d_tol:
+                        found = True
+                        break
+                if not found:
+                    group['diameters'].append(max_d)
+                added = True
+                break
+        if not added:
+            grouped_by_center.append({
+                'center': (cx, cy),
+                'diameters': [max_d]
+            })
+
+    # Agora, para o resumo, conta apenas grupos distintos de diâmetro (sem sobreposição)
+    all_counter = Counter()
+    for group in grouped_by_center:
+        # Agrupa diâmetros próximos
+        diams = sorted(group['diameters'])
+        merged = []
+        for d in diams:
+            if not merged or abs(d - merged[-1][1]) >= d_tol:
+                merged.append([d, d])
+            else:
+                merged[-1][1] = d
+        for dmin, dmax in merged:
+            key = (round(dmin, 1), round(dmax, 1))
+            all_counter[key] += 1
+    return all_counter
+# ----------------------------------------------------------------------------------------------------------------------
+# -------------------------------------------------- Other Details -----------------------------------------------------
+
+def is_open_edge(face, piece_bbox, tol=2.0):
+    """
+    Verifica se pelo menos um lado da face coincide com um dos limites globais da peça.
+    Considera 'slot aberto' se apenas UM lado tocar a borda da peça.
+    """
+    xmin_p, ymin_p, zmin_p, xmax_p, ymax_p, zmax_p = piece_bbox
+    xmin, ymin, zmin, xmax, ymax, zmax = get_bbox(face)
+    hits = [
+        abs(xmin - xmin_p) < tol,
+        abs(xmax - xmax_p) < tol,
+        abs(ymin - ymin_p) < tol,
+        abs(ymax - ymax_p) < tol,
+    ]
+    return sum(hits) == 1
+
+# ----------------------------------------------------------------------------------------------------------------------
+# ======================================================================================================================
+# ======================================================= Other ========================================================
+
+def axis_key(adaptor, loc_tol=0.2, dir_tol=0.02):
+    """
+    Gera uma chave de agrupamento baseada no centro (location) e direção (direction) do eixo,
+    ambos arredondados para permitir pequenas variações (tolerância).
+    - loc_tol: tolerância para a localização do centro (em mm)
+    - dir_tol: tolerância para a direção do eixo (unitário)
+    """
+    surface_type = adaptor.GetType()
+    if surface_type == GeomAbs_Cylinder:
+        axis = adaptor.Cylinder().Axis()
+    elif surface_type == GeomAbs_Cone:
+        axis = adaptor.Cone().Axis()
     else:
-        return 10.0
+        raise ValueError("Tipo de superfície não suportado em axis_key")
+    loc = axis.Location()
+    dir = axis.Direction()
+    # Arredonda para tolerância especificada
+    return (
+        round(loc.X() / loc_tol) * loc_tol,
+        round(loc.Y() / loc_tol) * loc_tol,
+        round(loc.Z() / loc_tol) * loc_tol,
+        round(dir.X() / dir_tol) * dir_tol,
+        round(dir.Y() / dir_tol) * dir_tol,
+        round(dir.Z() / dir_tol) * dir_tol,
+    )
+
+# ------------------------------------------------------------
+# --------------------- Needs Correction ---------------------
+
+def classify_hole_group_type(faces):
+    types = set()
+    for stype, _, _ in faces:
+        if stype == GeomAbs_Cylinder:
+            types.add("cilíndrico")
+        elif stype == GeomAbs_Cone:
+            types.add("cónico")
+    if types == {"cilíndrico"}:
+        return "cilíndrico"
+    elif types == {"cónico"}:
+        return "cónico"
+    elif types == {"cilíndrico", "cónico"}:
+        return "misto"
+    else:
+        return "desconhecido"
+
+# ----------------------------- main -------------------------------
+
+def get_circular_hole_diameters_by_type(shape):
+    """
+    Devolve uma lista [(min_d, max_d, tipo), ...] para furos passantes e fechados.
+    Cada grupo representa 1 furo real (pode ser misto cone/cilindro/cilindro+cone+cilindro).
+    """
+
+    loc_tol = get_auto_loc_tol(shape)
+    hole_groups = group_faces_by_axis_and_proximity(shape, loc_tol=loc_tol)
+
     
-# === utils auxiliares (usados caso necessário) ===
+    # --- BLOCO DE DEBUG ---
+    #for i, group in enumerate(hole_groups):
+    #    print(f"Grupo {i}: {len(group)} faces")
+    #    print("Tipos:", [classify_hole_group_type([face]) for face in group])
+    # -----------------------
 
-def project_point_to_bbox(loc, dir, bounds):
-    px, py, pz = loc.X(), loc.Y(), loc.Z()
-    dx, dy, dz = dir.X(), dir.Y(), dir.Z()
-    if abs(dx) < 1e-8: dx = 1e-8
-    if abs(dy) < 1e-8: dy = 1e-8
-    if abs(dz) < 1e-8: dz = 1e-8
+    diameters_through = []
+    diameters_closed = []
 
-    t_values = []
-    for i, (min_b, max_b, p, d) in enumerate(zip(bounds[:3], bounds[3:], [px, py, pz], [dx, dy, dz])):
-        t1 = (min_b - p) / d
-        t2 = (max_b - p) / d
-        t_values.extend([t1, t2])
-    t_values = [t for t in t_values if t > 0]
-    if not t_values:
-        return loc
-    t = min(t_values)
-    return gp_Pnt(px + t*dx, py + t*dy, pz + t*dz)
+    for faces in hole_groups:
+        radii, _ = get_all_radii_of_group(faces)
+        if not radii:
+            continue
+        min_d = round(min(radii) * 2, 2)
+        max_d = round(max(radii) * 2, 2)
+        tipo = classify_hole_group_type(faces)
+        result = is_hole_through(faces, shape)
+        data = (min_d, max_d, tipo)
+        if result:
+            diameters_through.append(data)
+        else:
+            diameters_closed.append(data)
+    return diameters_through, diameters_closed
+
+# ----------------------------------------------------------------------------------------------------------------------
