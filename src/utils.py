@@ -212,6 +212,66 @@ def get_all_radii_of_group(faces, min_allowed=3.0):
     radii = sorted(set(round(r, 2) for r in radii))
     return radii, has_cone
 
+def has_opposite_vertices(face, center, diameter, tol=2.0):
+    from OCC.Core.TopExp import TopExp_Explorer
+    from OCC.Core.TopAbs import TopAbs_VERTEX
+    from OCC.Core.BRep import BRep_Tool
+    vertices = []
+    explorer = TopExp_Explorer(face, TopAbs_VERTEX)
+    while explorer.More():
+        v = explorer.Current()
+        pnt = BRep_Tool.Pnt(v)
+        vertices.append((pnt.X(), pnt.Y(), pnt.Z()))
+        explorer.Next()
+    # Verifica se existe par de vértices com distância ~ diâmetro
+    for i in range(len(vertices)):
+        for j in range(i+1, len(vertices)):
+            dist = ((vertices[i][0] - vertices[j][0])**2 +
+                    (vertices[i][1] - vertices[j][1])**2 +
+                    (vertices[i][2] - vertices[j][2])**2) ** 0.5
+            if abs(dist - diameter) < tol:
+                return True
+    return False
+
+def merge_aligned_circular_features(features, axis_tol=30.0, center_tol=10.0, diameter_tol=2.0):
+    """
+    Agrupa features circulares com centros alinhados numa direção (por ex. Z), 
+    com diâmetros semelhantes e próximos no espaço.
+    """
+    merged = []
+    used = set()
+
+    for i, f1 in enumerate(features):
+        if i in used:
+            continue
+        group = [f1]
+        for j, f2 in enumerate(features):
+            if j <= i or j in used:
+                continue
+            # Verifica se os diâmetros são semelhantes
+            if abs(f1['max_d'] - f2['max_d']) > diameter_tol:
+                continue
+            # Verifica alinhamento em X/Y (ou outra direção dominante)
+            dx = abs(f1['center'][0] - f2['center'][0])
+            dy = abs(f1['center'][1] - f2['center'][1])
+            dz = abs(f1['center'][2] - f2['center'][2])
+            # Aqui vamos supor alinhamento em Z
+            if dx < axis_tol and dy < axis_tol and dz < center_tol:
+                group.append(f2)
+                used.add(j)
+        used.add(i)
+
+        # Agrupar os dados
+        center_avg = tuple(round(sum(f['center'][k] for f in group)/len(group), 2) for k in range(3))
+        all_min_d = [f['min_d'] for f in group]
+        all_max_d = [f['max_d'] for f in group]
+        merged.append({
+            'center': center_avg,
+            'min_d': round(min(all_min_d), 2),
+            'max_d': round(max(all_max_d), 2)
+        })
+    return merged
+
 # ******************************************** get_all_radii_of_group **********************************************
 
 def get_all_vertices_of_group(faces):
@@ -619,12 +679,11 @@ def group_semi_circular_arcs(arcs, group_tol=3.0):
 # ----------------------------------------------------------------------------------------------------------------------
 # --------------------------------------------------- Compare Details ------------------------------------------------------
 
-def group_holes_by_center(features, center_tol=3.0, d_tol=1.0):
-
+def group_holes_by_center(features, center_tol=10.0):
     """
-    Agrupa furos (circulares e semicirculares) com base na proximidade do centro (x, y)
-    e do diâmetro máximo. Para cada grupo, guarda todos os diâmetros únicos (com tolerância).
-    No resumo, só mostra grupos distintos, sem sobreposição de intervalos.
+    Agrupa furos (circulares e semicirculares) com base na proximidade do centro (x, y).
+    Para cada grupo, guarda todos os min_d e max_d.
+    No resumo, mostra o menor min_d e o maior max_d de cada grupo.
     """
     grouped_by_center = []
 
@@ -632,42 +691,30 @@ def group_holes_by_center(features, center_tol=3.0, d_tol=1.0):
         return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
 
     for feat in features:
-        cx, cy = feat['center']
-        min_d, max_d = feat['min_d'], feat['max_d']
+        cx, cy = feat['center'][:2]
+        min_d = feat['min_d']
+        max_d = feat['max_d']
         added = False
         for group in grouped_by_center:
             gx, gy = group['center']
             if dist2d((cx, cy), (gx, gy)) < center_tol:
-                # Verifica se já existe diâmetro semelhante neste grupo
-                found = False
-                for d in group['diameters']:
-                    if abs(d - max_d) < d_tol:
-                        found = True
-                        break
-                if not found:
-                    group['diameters'].append(max_d)
+                group['min_ds'].append(min_d)
+                group['max_ds'].append(max_d)
                 added = True
                 break
         if not added:
             grouped_by_center.append({
                 'center': (cx, cy),
-                'diameters': [max_d]
+                'min_ds': [min_d],
+                'max_ds': [max_d]
             })
 
-    # Agora, para o resumo, conta apenas grupos distintos de diâmetro (sem sobreposição)
     all_counter = Counter()
     for group in grouped_by_center:
-        # Agrupa diâmetros próximos
-        diams = sorted(group['diameters'])
-        merged = []
-        for d in diams:
-            if not merged or abs(d - merged[-1][1]) >= d_tol:
-                merged.append([d, d])
-            else:
-                merged[-1][1] = d
-        for dmin, dmax in merged:
-            key = (round(dmin, 1), round(dmax, 1))
-            all_counter[key] += 1
+        min_d = min(group['min_ds'])
+        max_d = max(group['max_ds'])
+        key = (round(min_d, 1), round(max_d, 1))
+        all_counter[key] += 1
     return all_counter
 # ----------------------------------------------------------------------------------------------------------------------
 # -------------------------------------------------- Other Details -----------------------------------------------------
@@ -726,12 +773,12 @@ def classify_hole_group_type(faces):
         if stype == GeomAbs_Cylinder:
             types.add("cilíndrico")
         elif stype == GeomAbs_Cone:
-            types.add("cónico")
+            types.add("cônico")
     if types == {"cilíndrico"}:
         return "cilíndrico"
-    elif types == {"cónico"}:
-        return "cónico"
-    elif types == {"cilíndrico", "cónico"}:
+    elif types == {"cônico"}:
+        return "cônico"
+    elif types == {"cilíndrico", "cônico"}:
         return "misto"
     else:
         return "desconhecido"

@@ -134,7 +134,7 @@ def is_point_inside_bbox(point, bbox, tol=0.5):
     """
     Verifica se um ponto (x, y) está dentro do bounding box.
     """
-    xmin, ymin, _, xmax, ymax, _ = bbox
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox
     x, y = point
     return (xmin - tol) <= x <= (xmax + tol) and (ymin - tol) <= y <= (ymax + tol)
 
@@ -171,7 +171,7 @@ def show_general_summary(shape, filepath=None):
     positions = detect_positions_from_holes(hole_groups, shape)
 
     # --- Remover duplicados entre circulares e semicirculares (por centro e diâmetro)
-    def feat_key(feat, center_tol=3.0, d_tol=2.0):
+    def feat_key(feat, center_tol=1.0, d_tol=0.5):
         return (round(feat['center'][0]/center_tol), round(feat['center'][1]/center_tol), round(feat['max_d']/d_tol))
 
     unique_feats = {}
@@ -217,33 +217,18 @@ def show_general_summary(shape, filepath=None):
     print(f"Qtd. furos quadrados/retangulares: {sum(rectangular_counter.values())}")
     print("\n" + "-" * 40)
 # --------------------------------------- Teste ---------------------------------------
-    print("=== DEBUG: Lista de furos circulares encontrados ===")
+
+    print("=== DEBUG 1: Lista de furos circulares encontrados ===")
     for f in circular_features:
         print(f"Centro: {f['center']}, min_d: {f['min_d']}, max_d: {f['max_d']}")
-    print("=== FIM DEBUG ===")
+    print("=== FIM DEBUG 1 ===")
 
-    print("=== DEBUG: Lista de furos semicirculares encontrados ===")
+    print("=== DEBUG 2: Lista de furos semicirculares encontrados ===")
     for f in semi_features:
         print(f"Centro: {f['center']}, min_d: {f['min_d']}, max_d: {f['max_d']}")
-    print("=== FIM DEBUG ===")
+    print("=== FIM DEBUG 2 ===")
 
-    centros = get_centros_furos_circulares(unique_feats)
-    print("Furos circulares (inclui semicirculares):")
-    if all_counter:
-        for (min_d, max_d), count in sorted(all_counter.items(), key=lambda x: -x[0][1]):
-            if min_d == max_d:
-                print(f"  Tem {count} furo(s) com {min_d:.1f} mm de diâmetro")
-            else:
-                print(f"  Tem {count} furo(s) de {min_d:.1f} mm a {max_d:.1f} mm de diâmetro")
-            # Imprime os centros deste grupo, se existirem
-            lista_centros = centros.get((min_d, max_d), [])
-            for x, y, z in lista_centros:
-                print(f"      Centro: ({x:.2f}, {y:.2f}, {z:.2f})")
-    else:
-        print("  Nenhum furo circular encontrado.")
-    print("\n" + "-" * 40)
 # -------------------------------------------------------------------------------------
-
     print("Furos circulares (inclui semicirculares):")
     if all_counter:
         for (min_d, max_d), count in sorted(all_counter.items(), key=lambda x: -x[0][1]):
@@ -265,22 +250,3 @@ def show_general_summary(shape, filepath=None):
     else:
         print("Furos retangulares/quadrados internos: não extraídos")
     print("\n" + "=" * 40)
-
-def get_centros_furos_circulares(unique_feats):
-    """
-    Devolve um dicionário diam_to_centers com os centros (x, y, z) de cada grupo de furos circulares/semicirculares.
-    Chave: (min_d, max_d), Valor: lista de centros (x, y, z)
-    """
-    diam_to_centers = {}
-    for feat in unique_feats.values():
-        key = (round(feat['min_d'], 1), round(feat['max_d'], 1))
-        center = feat['center']
-        if 'group' in feat and 'zs' in feat['group']:
-            zs = feat['group']['zs']
-            for z in zs:
-                center3d = (center[0], center[1], z)
-                diam_to_centers.setdefault(key, []).append(center3d)
-        else:
-            center3d = (center[0], center[1], 0.0)
-            diam_to_centers.setdefault(key, []).append(center3d)
-    return diam_to_centers
