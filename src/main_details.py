@@ -9,7 +9,8 @@ from .utils import (
     group_faces_by_axis_and_proximity, get_auto_loc_tol,
     get_all_radii_of_group, collect_semi_circular_arcs,
     group_semi_circular_arcs, group_holes_by_center,
-    extract_mold_and_part_from_step, detect_positions_from_holes
+    extract_mold_and_part_from_step, detect_positions_from_holes,
+    merge_aligned_circular_features
 )
 
 # 1. Furos retangulares/quadrados
@@ -70,12 +71,12 @@ def get_circular_holes(shape, semi_features=None):
         if adaptor.GetType() == GeomAbs_Cylinder:
             axis = adaptor.Cylinder().Axis()
             loc = axis.Location()
-            center_tuple = (round(loc.X(), 2), round(loc.Y(), 2))
+            center_tuple = (round(loc.X(), 2), round(loc.Y(), 2), round(loc.Z(), 2))
         else:
             bbox = get_bbox(main_face)
             cx = (bbox[0] + bbox[3]) / 2
             cy = (bbox[1] + bbox[4]) / 2
-            center_tuple = (round(cx, 2), round(cy, 2))
+            center_tuple = (round(cx, 2), round(cy, 2), 0.0)
 
         # Verificar duplicado com semicirculares (comparar centro e max_d)
         if semi_features and is_grouped_with_semi_arc(center_tuple, max_d, semi_features):
@@ -135,13 +136,15 @@ def is_point_inside_bbox(point, bbox, tol=0.5):
     Verifica se um ponto (x, y) está dentro do bounding box.
     """
     xmin, ymin, zmin, xmax, ymax, zmax = bbox
-    x, y = point
+    x, y = point[:2]  # Corrigido para aceitar tupla de 3 elementos
     return (xmin - tol) <= x <= (xmax + tol) and (ymin - tol) <= y <= (ymax + tol)
 
 # Função principal para o sumário geral
 def show_general_summary(shape, filepath=None):
     semi_features = get_semi_circular_holes(shape)
     circular_features = get_circular_holes(shape, semi_features=semi_features)
+    # Aplica agrupamento/filtragem para evitar duplicidades
+    circular_features = merge_aligned_circular_features(circular_features)
     rectangular_counter = get_rectangular_holes(shape)
 
     # --- NOVO: Extrair bounding box de cada retângulo realmente contado
@@ -216,17 +219,27 @@ def show_general_summary(shape, filepath=None):
     print(f"Qtd. furos circulares (inclui semicirculares): {sum(all_counter.values())}")
     print(f"Qtd. furos quadrados/retangulares: {sum(rectangular_counter.values())}")
     print("\n" + "-" * 40)
-# --------------------------------------- Teste ---------------------------------------
+# --------------------------------------- Teste --------------------------------------- 
 
-    print("=== DEBUG 1: Lista de furos circulares encontrados ===")
+    print(f"=== DEBUG : Lista de furos circulares encontrados ===")
     for f in circular_features:
         print(f"Centro: {f['center']}, min_d: {f['min_d']}, max_d: {f['max_d']}")
-    print("=== FIM DEBUG 1 ===")
+    print(f"=== FIM DEBUG ===")
 
-    print("=== DEBUG 2: Lista de furos semicirculares encontrados ===")
+    print(f"=== DEBUG : Lista de furos semicirculares encontrados ===")
     for f in semi_features:
         print(f"Centro: {f['center']}, min_d: {f['min_d']}, max_d: {f['max_d']}")
-    print("=== FIM DEBUG 2 ===")
+    print(f"=== FIM DEBUG ===")
+
+    print(f"=== DEBUG : Retângulos identificados ===")
+    for face, shape_type, length, width in filtered:
+        print(f"Tipo: {shape_type}, comprimento: {length}, largura: {width}")
+    print(f"=== FIM DEBUG ===")
+
+    print(f"=== DEBUG : Retângulos contados ===")
+    for (shape_type, rlength, rwidth), count in rectangular_counter.items():
+        print(f"Tipo: {shape_type}, comprimento: {rlength}, largura: {rwidth}, count: {count}")
+    print(f"=== FIM DEBUG ===")
 
 # -------------------------------------------------------------------------------------
     print("Furos circulares (inclui semicirculares):")

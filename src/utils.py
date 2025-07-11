@@ -773,12 +773,12 @@ def classify_hole_group_type(faces):
         if stype == GeomAbs_Cylinder:
             types.add("cilíndrico")
         elif stype == GeomAbs_Cone:
-            types.add("cônico")
+            types.add("cónico")
     if types == {"cilíndrico"}:
         return "cilíndrico"
-    elif types == {"cônico"}:
-        return "cônico"
-    elif types == {"cilíndrico", "cônico"}:
+    elif types == {"cónico"}:
+        return "cónico"
+    elif types == {"cilíndrico", "cónico"}:
         return "misto"
     else:
         return "desconhecido"
