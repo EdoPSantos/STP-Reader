@@ -6,17 +6,20 @@ from collections import defaultdict
 from collections import Counter
 from OCC.Core.TopoDS import TopoDS_Shape, topods, TopoDS_Face, TopoDS_Wire, TopoDS_Vertex
 from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Plane
-from OCC.Core.TopTools import TopTools_IndexedMapOfShape
-from OCC.Core.TopAbs import TopAbs_VERTEX, TopAbs_FACE
+from OCC.Core.TopTools import TopTools_IndexedMapOfShape, TopTools_IndexedDataMapOfShapeListOfShape, TopTools_ListIteratorOfListOfShape
+from OCC.Core.TopAbs import TopAbs_VERTEX, TopAbs_FACE, TopAbs_EDGE
 from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
 from OCC.Core.gp import gp_Pnt, gp_Vec, gp_Dir
 from OCC.Core.TopExp import TopExp_Explorer
+import OCC.Core.TopExp
 from OCC.Core.BRepBndLib import brepbndlib
 from OCC.Core.BRepGProp import brepgprop
 from OCC.Core.BRepTools import breptools
 from OCC.Core.GProp import GProp_GProps
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.Bnd import Bnd_Box
+from OCC.Core.GeomAdaptor import GeomAdaptor_Curve
+from OCC.Core.GeomAbs import GeomAbs_Circle
 
 # ==================================================== Main Details ====================================================
 
@@ -70,8 +73,6 @@ def get_bbox(shape_or_face):
     """
     Retorna a bounding box de uma shape ou face: (xmin, ymin, zmin, xmax, ymax, zmax)
     """
-    from OCC.Core.Bnd import Bnd_Box
-    from OCC.Core.BRepBndLib import brepbndlib
 
     bbox = Bnd_Box()
     brepbndlib.Add(shape_or_face, bbox)
@@ -115,7 +116,6 @@ def group_faces_by_axis_and_proximity(shape, loc_tol=2.0, dir_tol=0.05):
     """
     explorer = TopExp_Explorer(shape, TopAbs_FACE)
     temp_groups = []
-
     while explorer.More():
         face = explorer.Current()
         surface = BRep_Tool.Surface(face)
@@ -124,7 +124,6 @@ def group_faces_by_axis_and_proximity(shape, loc_tol=2.0, dir_tol=0.05):
         if stype not in (GeomAbs_Cylinder, GeomAbs_Cone):
             explorer.Next()
             continue
-
         # Obter centro e direção
         if stype == GeomAbs_Cylinder:
             axis = adaptor.Cylinder().Axis()
@@ -166,14 +165,72 @@ def group_faces_by_axis_and_proximity(shape, loc_tol=2.0, dir_tol=0.05):
                     used[j] = True
         groups.append([(item['stype'], item['face'], item['adaptor']) for item in group])
     return groups
+# ======================================================================================================================
+# Nova função: extrai furos retangulares usando bounding box das faces não circulares
+def extract_rectangular_holes_by_bbox(shape, tol_circular=0.5):
+    """
+    Extrai furos retangulares (ou qualquer furo não circular) usando bounding box das faces planas não circulares.
+    Para cada face plana não circular:
+      - Calcula bounding box
+      - Extrai largura, comprimento, altura e centro
+      - Ignora faces circulares
+    Retorna lista de dicts: {'length', 'width', 'height', 'center', 'bbox'}
+    """
+
+    rectangular_holes = []
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    while explorer.More():
+        face = topods.Face(explorer.Current())
+        adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
+        if adaptor.GetType() != GeomAbs_Plane:
+            explorer.Next()
+            continue
+        # Ignora faces circulares
+        outer_wire = breptools.OuterWire(face)
+        vertex_explorer = TopExp_Explorer(outer_wire, TopAbs_VERTEX)
+        vertices = []
+        while vertex_explorer.More():
+            vertex = topods.Vertex(vertex_explorer.Current())
+            pnt = BRep_Tool.Pnt(vertex)
+            vertices.append((pnt.X(), pnt.Y(), pnt.Z()))
+            vertex_explorer.Next()
+        if len(vertices) < 3:
+            explorer.Next()
+            continue
+        # Testa se é circular
+        cx = sum(v[0] for v in vertices) / len(vertices)
+        cy = sum(v[1] for v in vertices) / len(vertices)
+        cz = sum(v[2] for v in vertices) / len(vertices)
+        radii = [math.sqrt((v[0] - cx) ** 2 + (v[1] - cy) ** 2 + (v[2] - cz) ** 2) for v in vertices]
+        avg_radius = sum(radii) / len(radii)
+        if all(abs(r - avg_radius) < tol_circular for r in radii):
+            explorer.Next()
+            continue  # ignora círculos
+        # Calcula bounding box
+        bbox = Bnd_Box()
+        brepbndlib.Add(face, bbox)
+        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+        dx = abs(xmax - xmin)
+        dy = abs(ymax - ymin)
+        dz = abs(zmax - zmin)
+        # Centro
+        center = ((xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2)
+        # Guarda info
+        rectangular_holes.append({
+            'length': round(max(dx, dy), 2),
+            'width': round(min(dx, dy), 2),
+            'height': round(dz, 2),
+            'center': tuple(round(c, 2) for c in center),
+            'bbox': (xmin, ymin, zmin, xmax, ymax, zmax)
+        })
+        explorer.Next()
+    return rectangular_holes
 
 def get_all_radii_of_group(faces, min_allowed=3.0):
     """
     Retorna todos os raios (em mm) de todas as faces do grupo.
     Para cones, calcula sempre o raio nos dois extremos da face (base e topo).
     """
-    import math
-    from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone
 
     radii = []
     has_cone = False
@@ -213,9 +270,6 @@ def get_all_radii_of_group(faces, min_allowed=3.0):
     return radii, has_cone
 
 def has_opposite_vertices(face, center, diameter, tol=2.0):
-    from OCC.Core.TopExp import TopExp_Explorer
-    from OCC.Core.TopAbs import TopAbs_VERTEX
-    from OCC.Core.BRep import BRep_Tool
     vertices = []
     explorer = TopExp_Explorer(face, TopAbs_VERTEX)
     while explorer.More():
@@ -296,9 +350,6 @@ def detect_positions_from_holes(axis_groups, shape):
     """
     has_up = False
     has_down = False
-    from OCC.Core.GeomAbs import GeomAbs_Cylinder
-    from OCC.Core.Bnd import Bnd_Box
-    from OCC.Core.BRepBndLib import brepbndlib
     for i, faces in enumerate(axis_groups):
         if is_hole_through(faces, shape):
             # print(f"Grupo {i}: passante")
@@ -448,6 +499,7 @@ def find_slots(shape):
             # Opcional: verifica se há faces planas paralelas com estas dimensões entre os cilindros
             slots.append((comprimento, largura))
     return slots
+
 # *************************************************** find_slots ***************************************************
 
 def get_cylindrical_faces(shape, min_radius=2.0, max_radius=30.0):
@@ -605,12 +657,6 @@ def collect_semi_circular_arcs(shape, lateral_tol=3.0, angle_tol=30.0, radius_to
     Recolhe todos os recortes semicirculares (arcos ~180º perto da lateral) e devolve lista de dicts:
     {'center': (x, y, z), 'radius': r, 'angle': angle}
     """
-    from OCC.Core.BRep import BRep_Tool
-    from OCC.Core.TopExp import TopExp_Explorer
-    from OCC.Core.TopAbs import TopAbs_EDGE
-    from OCC.Core.GeomAdaptor import GeomAdaptor_Curve
-    from OCC.Core.GeomAbs import GeomAbs_Circle
-    import math
 
     results = []
     piece_bbox = get_bbox(shape)
@@ -819,4 +865,143 @@ def get_circular_hole_diameters_by_type(shape):
             diameters_closed.append(data)
     return diameters_through, diameters_closed
 
+# ======================================================================================================================
+
+# Nova função: extrai furos retangulares usando bounding box das faces não circulares
+def extract_rectangular_holes_by_bbox(shape, tol_circular=0.5):
+    """
+    Extrai furos retangulares (ou qualquer furo não circular) usando bounding box das faces planas não circulares.
+    Para cada face plana não circular:
+      - Calcula bounding box
+      - Extrai largura, comprimento, altura e centro
+      - Ignora faces circulares
+    Retorna lista de dicts: {'length', 'width', 'height', 'center', 'bbox'}
+    """
+    rectangular_holes = []
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    while explorer.More():
+        face = topods.Face(explorer.Current())
+        adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
+        if adaptor.GetType() != GeomAbs_Plane:
+            explorer.Next()
+            continue
+        # Obtém vértices do contorno
+        outer_wire = breptools.OuterWire(face)
+        vertex_explorer = TopExp_Explorer(outer_wire, TopAbs_VERTEX)
+        vertices = []
+        while vertex_explorer.More():
+            vertex = topods.Vertex(vertex_explorer.Current())
+            pnt = BRep_Tool.Pnt(vertex)
+            vertices.append((pnt.X(), pnt.Y(), pnt.Z()))
+            vertex_explorer.Next()
+        if len(vertices) < 3:
+            explorer.Next()
+            continue
+        # Testa se é uma circunferência isolada (todos os vértices equidistantes do centro e pelo menos 5 vértices)
+        cx = sum(v[0] for v in vertices) / len(vertices)
+        cy = sum(v[1] for v in vertices) / len(vertices)
+        cz = sum(v[2] for v in vertices) / len(vertices)
+        radii = [math.sqrt((v[0] - cx) ** 2 + (v[1] - cy) ** 2 + (v[2] - cz) ** 2) for v in vertices]
+        avg_radius = sum(radii) / len(radii)
+        # Se todos os vértices equidistantes do centro E tem pelo menos 5 vértices, é círculo isolado
+        if len(vertices) >= 5 and all(abs(r - avg_radius) < tol_circular for r in radii):
+            explorer.Next()
+            continue  # ignora círculos isolados
+        # Caso contrário, pode ser contorno misto (retângulo com arco/círculo)
+        bbox = Bnd_Box()
+        brepbndlib.Add(face, bbox)
+        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+        dx = abs(xmax - xmin)
+        dy = abs(ymax - ymin)
+        dz = abs(zmax - zmin)
+        center = ((xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2)
+        rectangular_holes.append({
+            'length': round(max(dx, dy), 2),
+            'width': round(min(dx, dy), 2),
+            'height': round(dz, 2),
+            'center': tuple(round(c, 2) for c in center),
+            'bbox': (xmin, ymin, zmin, xmax, ymax, zmax)
+        })
+        explorer.Next()
+    return rectangular_holes
+
+# Função: retorna todas as faces planas (inclusive circulares) com bbox e medidas
+def get_all_planar_faces_bbox(shape):
+    """
+    Retorna lista de dicts com centro, comprimento, largura, altura e bbox de todas as faces planas (inclusive circulares).
+    """
+    result = []
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    from OCC.Core.GeomAbs import GeomAbs_Plane, GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Sphere, GeomAbs_Torus
+    while explorer.More():
+        face = explorer.Current()
+        adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
+        stype = adaptor.GetType()
+        bbox = Bnd_Box()
+        brepbndlib.Add(face, bbox)
+        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+        dx = abs(xmax - xmin)
+        dy = abs(ymax - ymin)
+        dz = abs(zmax - zmin)
+        center = ((xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2)
+        tipo = None
+        if stype == GeomAbs_Plane:
+            tipo = 'plano'
+        elif stype == GeomAbs_Cylinder:
+            tipo = 'cilindro'
+        elif stype == GeomAbs_Cone:
+            tipo = 'cone'
+        elif stype == GeomAbs_Sphere:
+            tipo = 'esfera'
+        elif stype == GeomAbs_Torus:
+            tipo = 'toro'
+        else:
+            tipo = str(stype)
+        result.append({
+            'type': tipo,
+            'center': tuple(round(c, 2) for c in center),
+            'length': round(max(dx, dy), 2),
+            'width': round(min(dx, dy), 2),
+            'height': round(dz, 2),
+            'bbox': (xmin, ymin, zmin, xmax, ymax, zmax)
+        })
+        explorer.Next()
+    return result
+
+def group_faces_by_topology(shape):
+    # Novo agrupamento por conectividade de vértices (x1,y1) == (x2,y2) de outra face
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    face_bboxes = []
+    while explorer.More():
+        face = explorer.Current()
+        bbox = Bnd_Box()
+        brepbndlib.Add(face, bbox)
+        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+        face_bboxes.append({
+            'face': face,
+            'bbox': (xmin, ymin, zmin, xmax, ymax, zmax)
+        })
+        explorer.Next()
+
+    # Agrupamento: cada grupo contém faces conectadas por (x1,y1) == (x2,y2) de outra
+    grupos = []
+    usados = set()
+    for i, f1 in enumerate(face_bboxes):
+        if i in usados:
+            continue
+        grupo = [f1['face']]
+        usados.add(i)
+        x1_1, y1_1 = round(f1['bbox'][0], 5), round(f1['bbox'][1], 5)
+        x2_1, y2_1 = round(f1['bbox'][3], 5), round(f1['bbox'][4], 5)
+        for j, f2 in enumerate(face_bboxes):
+            if j == i or j in usados:
+                continue
+            x1_2, y1_2 = round(f2['bbox'][0], 5), round(f2['bbox'][1], 5)
+            x2_2, y2_2 = round(f2['bbox'][3], 5), round(f2['bbox'][4], 5)
+            # Se (x1_1, y1_1) == (x2_2, y2_2) ou (x2_1, y2_1) == (x1_2, y1_2), agrupa
+            if (x1_1 == x2_2 and y1_1 == y2_2) or (x2_1 == x1_2 and y2_1 == y1_2):
+                grupo.append(f2['face'])
+                usados.add(j)
+        grupos.append(grupo)
+    return grupos
 # ----------------------------------------------------------------------------------------------------------------------

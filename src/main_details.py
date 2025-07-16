@@ -1,6 +1,12 @@
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepBndLib import brepbndlib
+from OCC.Core.TopExp import TopExp_Explorer
+import OCC.Core.TopExp
+from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE
+from OCC.Core.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
+from OCC.Core.GeomAbs import GeomAbs_Plane
 from collections import Counter
 from .utils import (
     find_slots, group_non_circular_planar_faces,
@@ -10,7 +16,8 @@ from .utils import (
     get_all_radii_of_group, collect_semi_circular_arcs,
     group_semi_circular_arcs, group_holes_by_center,
     extract_mold_and_part_from_step, detect_positions_from_holes,
-    merge_aligned_circular_features
+    merge_aligned_circular_features, extract_rectangular_holes_by_bbox,
+    get_all_planar_faces_bbox, group_faces_by_topology,
 )
 
 # 1. Furos retangulares/quadrados
@@ -262,4 +269,112 @@ def show_general_summary(shape, filepath=None):
                 print(f"  Tem {count} furo(s) [retangular] com {rlength} mm de comprimento e {rwidth} mm de largura")
     else:
         print("Furos retangulares/quadrados internos: não extraídos")
-    print("\n" + "=" * 40)
+    
+    print("\n" + "-" * 40)
+
+    # Novo metodo aqui -------------------------------------------------------------------
+    # Novo método: mostrar furos retangulares detectados pela bounding box
+    rect_bbox_list = extract_rectangular_holes_by_bbox(shape)
+    print("\n" + "=== NOVO Método: Furos retangulares por bounding box ===")
+    if rect_bbox_list:
+        for rect in rect_bbox_list:
+            print(f"Centro: {rect['center']}, CxL: {rect['length']} x {rect['width']} mm, Altura: {rect['height']} mm")
+    else:
+        print("Nenhum furo retangular encontrado pelo novo método.")
+
+    print("*" * 40)
+    
+    print("\n=== Todas as formas geométricas (planas, curvas, circulares, etc.) ===")
+    all_faces = get_all_planar_faces_bbox(shape)
+    if all_faces:
+        for f in all_faces:
+            bbox_fmt = tuple(round(v, 3) for v in f['bbox'])
+            print(f"Tipo: {f['type']}, Centro: {f['center']}, \n  1- Comprimento: {f['length']} mm, Largura: {f['width']} mm, Altura: {f['height']} mm, \n  2- BBox: {bbox_fmt}")
+    else:
+        print("Nenhuma face geométrica encontrada.")
+    # -------------------------------------------------------------------------------------
+    # === Grupos de furos retangulares (com faces curvas e circulares) ===
+    print("\n=== Grupos de furos retangulares (por conectividade de faces) ===")
+
+    chapa_bbox = get_bbox(shape)
+    xmin_c, ymin_c, zmin_c, xmax_c, ymax_c, zmax_c = chapa_bbox
+
+    grupos = group_faces_by_topology(shape)
+    rect_bboxes_set = set(tuple(round(v,3) for v in bbox) for bbox in rectangular_bboxes)
+    grupo_id = 1
+
+    for grupo in grupos:
+        grupo_info = []
+        # Para rastrear ligações: cada item será (face, ligada_por_idx)
+        ligacoes = []
+        # Mapeia bbox para índice
+        bbox_to_idx = {}
+        for idx, face in enumerate(grupo):
+            bbox = get_bbox(face)
+            if bbox[0] < xmin_c or bbox[1] < ymin_c or bbox[2] < zmin_c:
+                continue
+            if bbox[3] > xmax_c or bbox[4] > ymax_c or bbox[5] > zmax_c:
+                continue
+            center = ((bbox[0]+bbox[3])/2, (bbox[1]+bbox[4])/2, (bbox[2]+bbox[5])/2)
+            adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
+            stype = adaptor.GetType()
+            tipo = {1: "plano", 2: "cilindro", 3: "cone", 4: "esfera", 5: "toro"}.get(stype, str(stype))
+            dx = abs(bbox[3] - bbox[0])
+            dy = abs(bbox[4] - bbox[1])
+            dz = abs(bbox[5] - bbox[2])
+            grupo_info.append({
+                'face': face,
+                'center': tuple(round(c, 2) for c in center),
+                'tipo': tipo,
+                'length': round(max(dx, dy), 2),
+                'width': round(min(dx, dy), 2),
+                'height': round(dz, 2),
+                'bbox': tuple(round(v, 3) for v in bbox)
+            })
+            bbox_to_idx[tuple(round(v, 5) for v in bbox)] = idx
+        # Descobre ligações reais
+        for idx, info in enumerate(grupo_info):
+            x1, y1 = round(info['bbox'][0], 5), round(info['bbox'][1], 5)
+            x2, y2 = round(info['bbox'][3], 5), round(info['bbox'][4], 5)
+            ligada_por = None
+            for jdx, other in enumerate(grupo_info):
+                if idx == jdx:
+                    continue
+                ox1, oy1 = round(other['bbox'][0], 5), round(other['bbox'][1], 5)
+                ox2, oy2 = round(other['bbox'][3], 5), round(other['bbox'][4], 5)
+                # Se (x1,y1) == (ox2,oy2) ou (x2,y2) == (ox1,oy1), registra ligação
+                if (x1 == ox2 and y1 == oy2):
+                    ligada_por = jdx+1
+                if (x2 == ox1 and y2 == oy1):
+                    ligada_por = jdx+1
+            ligacoes.append(ligada_por)
+        # Monta ordem de ligação
+        ordem_ligacao = []
+        for idx, ligada_por in enumerate(ligacoes):
+            if ligada_por:
+                ordem_ligacao.append(f"Face {ligada_por} -> Face {idx+1}")
+            else:
+                ordem_ligacao.append(f"Face {idx+1} (origem)")
+
+        if not grupo_info:
+            continue
+
+        todos_ja_contados = all(info['bbox'] in rect_bboxes_set for info in grupo_info)
+        print(f"\nGrupo {grupo_id}:")
+        grupo_id += 1
+        if todos_ja_contados:
+            print("  (Todas as faces deste grupo já foram contadas nos furos retangulares)")
+            continue
+
+        # Exibe a ordem de ligação real das faces
+        print("  Ordem de ligação:")
+        for item in ordem_ligacao:
+            print(f"    {item}")
+
+        for idx, info in enumerate(grupo_info):
+            if info['bbox'] in rect_bboxes_set:
+                continue
+            print(f"  Face {idx+1}: Tipo: {info['tipo']}, Centro: {info['center']}, "
+                  f"Comprimento: {info['length']} mm, Largura: {info['width']} mm, Altura: {info['height']} mm"
+                  f"\n    BBox: {info['bbox']}")
+        print("\n" + "=" * 40)
