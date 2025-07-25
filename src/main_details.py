@@ -7,7 +7,7 @@ from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE
 from OCC.Core.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
 from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
 from OCC.Core.GeomAbs import GeomAbs_Plane
-from collections import Counter
+from collections import Counter, defaultdict
 from .utils import (
     find_slots, group_non_circular_planar_faces,
     auto_filter_rectangular_faces, get_piece_dimensions,
@@ -16,8 +16,8 @@ from .utils import (
     get_all_radii_of_group, collect_semi_circular_arcs,
     group_semi_circular_arcs, group_holes_by_center,
     extract_mold_and_part_from_step, detect_positions_from_holes,
-    merge_aligned_circular_features, extract_rectangular_holes_by_bbox,
-    get_all_planar_faces_bbox, group_faces_by_topology,
+    merge_aligned_circular_features,
+    get_all_planar_faces_bbox,
 )
 
 # 1. Furos retangulares/quadrados
@@ -227,7 +227,7 @@ def show_general_summary(shape, filepath=None):
     print(f"Qtd. furos quadrados/retangulares: {sum(rectangular_counter.values())}")
     print("\n" + "-" * 40)
 # --------------------------------------- Teste --------------------------------------- 
-
+    """
     print(f"=== DEBUG : Lista de furos circulares encontrados ===")
     for f in circular_features:
         print(f"Centro: {f['center']}, min_d: {f['min_d']}, max_d: {f['max_d']}")
@@ -247,8 +247,9 @@ def show_general_summary(shape, filepath=None):
     for (shape_type, rlength, rwidth), count in rectangular_counter.items():
         print(f"Tipo: {shape_type}, comprimento: {rlength}, largura: {rwidth}, count: {count}")
     print(f"=== FIM DEBUG ===")
-
+    """
 # -------------------------------------------------------------------------------------
+    
     print("Furos circulares (inclui semicirculares):")
     if all_counter:
         for (min_d, max_d), count in sorted(all_counter.items(), key=lambda x: -x[0][1]):
@@ -272,109 +273,129 @@ def show_general_summary(shape, filepath=None):
     
     print("\n" + "-" * 40)
 
-    # Novo metodo aqui -------------------------------------------------------------------
-    # Novo método: mostrar furos retangulares detectados pela bounding box
-    rect_bbox_list = extract_rectangular_holes_by_bbox(shape)
-    print("\n" + "=== NOVO Método: Furos retangulares por bounding box ===")
-    if rect_bbox_list:
-        for rect in rect_bbox_list:
-            print(f"Centro: {rect['center']}, CxL: {rect['length']} x {rect['width']} mm, Altura: {rect['height']} mm")
-    else:
-        print("Nenhum furo retangular encontrado pelo novo método.")
-
-    print("*" * 40)
-    
-    print("\n=== Todas as formas geométricas (planas, curvas, circulares, etc.) ===")
     all_faces = get_all_planar_faces_bbox(shape)
+    """
+    print("\n=== Todas as formas geométricas (planas, curvas, circulares, etc.) ===")
     if all_faces:
-        for f in all_faces:
-            bbox_fmt = tuple(round(v, 3) for v in f['bbox'])
-            print(f"Tipo: {f['type']}, Centro: {f['center']}, \n  1- Comprimento: {f['length']} mm, Largura: {f['width']} mm, Altura: {f['height']} mm, \n  2- BBox: {bbox_fmt}")
+        for idx, f in enumerate(all_faces, 1):
+            bbox = f['bbox']
+            xmin, ymin, zmin, xmax, ymax, zmax = bbox
+            tipo = f.get('type', '')
+            center = f.get('center', (None, None, None))
+            # Corrige apenas para cilindros: garante que ymin < ymax e o centro Y está entre eles
+            if tipo == 'cilindro' and ymin > ymax:
+                ymin, ymax = ymax, ymin
+            # Opcional: garantir que o centro Y está entre ymin e ymax (para casos raros)
+            if tipo == 'cilindro' and not (ymin <= center[1] <= ymax):
+                ymin, ymax = min(ymin, ymax), max(ymin, ymax)
+            bbox_fmt = (round(xmin, 3), round(ymin, 3), round(zmin, 3), round(xmax, 3), round(ymax, 3), round(zmax, 3))
+            print(f"\n{idx}) Tipo: {tipo}, Centro: {center}, \n  1- Comprimento: {f['length']} mm, Largura: {f['width']} mm, Altura: {f['height']} mm, \n  2- BBox: {bbox_fmt}")
     else:
-        print("Nenhuma face geométrica encontrada.")
-    # -------------------------------------------------------------------------------------
-    # === Grupos de furos retangulares (com faces curvas e circulares) ===
-    print("\n=== Grupos de furos retangulares (por conectividade de faces) ===")
+        print("Nenhuma face geométrica encontrada.")"""
+
+# -------------------------------------------------------------------------------------
+    # === Grupos de furos retangulares (apenas faces de all_faces, agrupando por extremos x/y) ===
+    print("\n=== Grupos de furos retangulares (por conectividade XY das faces exibidas) ===")
 
     chapa_bbox = get_bbox(shape)
     xmin_c, ymin_c, zmin_c, xmax_c, ymax_c, zmax_c = chapa_bbox
 
-    grupos = group_faces_by_topology(shape)
-    rect_bboxes_set = set(tuple(round(v,3) for v in bbox) for bbox in rectangular_bboxes)
-    grupo_id = 1
+    # Filtra faces para garantir que estão dentro do z da chapa
+    faces_xy = [f for f in all_faces if zmin_c <= f['center'][2] <= zmax_c]
 
+    # Agrupa faces por conectividade XY (se algum extremo x/y de uma face "toca" outro de outra face)
+    # --- Agrupamento por conectividade transitiva (DFS) ---
+    tol = 1e-3
+    n = len(faces_xy)
+    conexoes = [[] for _ in range(n)]
+    # Monta lista de conexões
+    for i, f1 in enumerate(faces_xy):
+        bbox1 = f1['bbox']
+        x1min, y1min, _, x1max, y1max, _ = bbox1
+        for j, f2 in enumerate(faces_xy):
+            if j == i:
+                continue
+            bbox2 = f2['bbox']
+            x2min, y2min, _, x2max, y2max, _ = bbox2
+            x_conectado = (
+                abs(x1min - x2max) < tol or abs(x1max - x2min) < tol or abs(x1min - x2min) < tol or abs(x1max - x2max) < tol
+            )
+            y_conectado = (
+                abs(y1min - y2max) < tol or abs(y1max - y2min) < tol or abs(y1min - y2min) < tol or abs(y1max - y2max) < tol
+            )
+            if x_conectado and y_conectado:
+                conexoes[i].append(j)
+
+    # Busca em profundidade para encontrar componentes conexos
+    usados = set()
+    grupos = []
+    def dfs(idx, grupo):
+        usados.add(idx)
+        grupo.append(faces_xy[idx])
+        for viz in conexoes[idx]:
+            if viz not in usados:
+                dfs(viz, grupo)
+
+    for i in range(n):
+        if i not in usados:
+            grupo = []
+            dfs(i, grupo)
+            grupos.append(grupo)
+
+    print(f"DEBUG: {len(grupos)} grupos encontrados por conectividade XY")
+
+    # --- Resumo dos grupos ---
+    print("\nResumo dos grupos:")
+    resumo = []
     for grupo in grupos:
-        grupo_info = []
-        # Para rastrear ligações: cada item será (face, ligada_por_idx)
-        ligacoes = []
-        # Mapeia bbox para índice
-        bbox_to_idx = {}
-        for idx, face in enumerate(grupo):
-            bbox = get_bbox(face)
-            if bbox[0] < xmin_c or bbox[1] < ymin_c or bbox[2] < zmin_c:
-                continue
-            if bbox[3] > xmax_c or bbox[4] > ymax_c or bbox[5] > zmax_c:
-                continue
-            center = ((bbox[0]+bbox[3])/2, (bbox[1]+bbox[4])/2, (bbox[2]+bbox[5])/2)
-            adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
-            stype = adaptor.GetType()
-            tipo = {1: "plano", 2: "cilindro", 3: "cone", 4: "esfera", 5: "toro"}.get(stype, str(stype))
-            dx = abs(bbox[3] - bbox[0])
-            dy = abs(bbox[4] - bbox[1])
-            dz = abs(bbox[5] - bbox[2])
-            grupo_info.append({
-                'face': face,
-                'center': tuple(round(c, 2) for c in center),
-                'tipo': tipo,
-                'length': round(max(dx, dy), 2),
-                'width': round(min(dx, dy), 2),
-                'height': round(dz, 2),
-                'bbox': tuple(round(v, 3) for v in bbox)
-            })
-            bbox_to_idx[tuple(round(v, 5) for v in bbox)] = idx
-        # Descobre ligações reais
-        for idx, info in enumerate(grupo_info):
-            x1, y1 = round(info['bbox'][0], 5), round(info['bbox'][1], 5)
-            x2, y2 = round(info['bbox'][3], 5), round(info['bbox'][4], 5)
-            ligada_por = None
-            for jdx, other in enumerate(grupo_info):
-                if idx == jdx:
-                    continue
-                ox1, oy1 = round(other['bbox'][0], 5), round(other['bbox'][1], 5)
-                ox2, oy2 = round(other['bbox'][3], 5), round(other['bbox'][4], 5)
-                # Se (x1,y1) == (ox2,oy2) ou (x2,y2) == (ox1,oy1), registra ligação
-                if (x1 == ox2 and y1 == oy2):
-                    ligada_por = jdx+1
-                if (x2 == ox1 and y2 == oy1):
-                    ligada_por = jdx+1
-            ligacoes.append(ligada_por)
-        # Monta ordem de ligação
-        ordem_ligacao = []
-        for idx, ligada_por in enumerate(ligacoes):
-            if ligada_por:
-                ordem_ligacao.append(f"Face {ligada_por} -> Face {idx+1}")
-            else:
-                ordem_ligacao.append(f"Face {idx+1} (origem)")
-
-        if not grupo_info:
+        if len(grupo) < 2:
             continue
+        xmins = [f['bbox'][0] for f in grupo]
+        ymins = [f['bbox'][1] for f in grupo]
+        xmaxs = [f['bbox'][3] for f in grupo]
+        ymaxs = [f['bbox'][4] for f in grupo]
+        xmin_g = min(xmins)
+        xmax_g = max(xmaxs)
+        ymin_g = min(ymins)
+        ymax_g = max(ymaxs)
+        comprimento_g = round(xmax_g - xmin_g, 3)
+        largura_g = round(ymax_g - ymin_g, 3)
+        resumo.append((len(grupo), comprimento_g, largura_g))
+    for idx, (nfaces, comp, larg) in enumerate(resumo, 1):
+        print(f"  Grupo {idx}: {nfaces} faces | Comprimento: {comp} mm | Largura: {larg} mm")
 
-        todos_ja_contados = all(info['bbox'] in rect_bboxes_set for info in grupo_info)
-        print(f"\nGrupo {grupo_id}:")
+    # --- Detalhamento dos grupos ---
+    grupo_id = 1
+    for grupo in grupos:
+        if len(grupo) < 2:
+            continue
+        xmins = [f['bbox'][0] for f in grupo]
+        ymins = [f['bbox'][1] for f in grupo]
+        xmaxs = [f['bbox'][3] for f in grupo]
+        ymaxs = [f['bbox'][4] for f in grupo]
+        xmin_g = min(xmins)
+        xmax_g = max(xmaxs)
+        ymin_g = min(ymins)
+        ymax_g = max(ymaxs)
+        comprimento_g = round(xmax_g - xmin_g, 3)
+        largura_g = round(ymax_g - ymin_g, 3)
+        print(f"\nGrupo {grupo_id} (({len(grupo)}) faces conectadas XY): Comprimento grupo: {comprimento_g} mm, Largura grupo: {largura_g} mm\n")
         grupo_id += 1
-        if todos_ja_contados:
-            print("  (Todas as faces deste grupo já foram contadas nos furos retangulares)")
-            continue
-
-        # Exibe a ordem de ligação real das faces
-        print("  Ordem de ligação:")
-        for item in ordem_ligacao:
-            print(f"    {item}")
-
-        for idx, info in enumerate(grupo_info):
-            if info['bbox'] in rect_bboxes_set:
-                continue
-            print(f"  Face {idx+1}: Tipo: {info['tipo']}, Centro: {info['center']}, "
-                  f"Comprimento: {info['length']} mm, Largura: {info['width']} mm, Altura: {info['height']} mm"
-                  f"\n    BBox: {info['bbox']}")
-        print("\n" + "=" * 40)
+        for idx_grupo, info in enumerate(grupo, 1):
+            tipo = info.get('type', '')
+            center = info.get('center', (None, None, None))
+            bbox = info['bbox']
+            xmin, ymin, zmin, xmax, ymax, zmax = bbox
+            # Corrige apenas para cilindros: garante que ymin < ymax e o centro Y está entre eles
+            if tipo == 'cilindro' and ymin > ymax:
+                ymin, ymax = ymax, ymin
+            if tipo == 'cilindro' and not (ymin <= center[1] <= ymax):
+                ymin, ymax = min(ymin, ymax), max(ymin, ymax)
+            bbox_fmt = (round(xmin, 3), round(ymin, 3), round(zmin, 3), round(xmax, 3), round(ymax, 3), round(zmax, 3))
+            comprimento_bbox = round(xmax - xmin, 3)
+            largura_bbox = round(ymax - ymin, 3)
+            print(f"  Face (idx {idx_grupo} de {len(grupo)}): Tipo: {tipo}, Centro: {center}, "
+                  f"\n    Comprimento: {info['length']} mm, Largura: {info['width']} mm, Altura: {info['height']} mm"
+                  f"\n    BBox: {bbox_fmt}\n")
+    
+    print("\n" + "=" * 40)

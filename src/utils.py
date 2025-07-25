@@ -166,65 +166,6 @@ def group_faces_by_axis_and_proximity(shape, loc_tol=2.0, dir_tol=0.05):
         groups.append([(item['stype'], item['face'], item['adaptor']) for item in group])
     return groups
 # ======================================================================================================================
-# Nova função: extrai furos retangulares usando bounding box das faces não circulares
-def extract_rectangular_holes_by_bbox(shape, tol_circular=0.5):
-    """
-    Extrai furos retangulares (ou qualquer furo não circular) usando bounding box das faces planas não circulares.
-    Para cada face plana não circular:
-      - Calcula bounding box
-      - Extrai largura, comprimento, altura e centro
-      - Ignora faces circulares
-    Retorna lista de dicts: {'length', 'width', 'height', 'center', 'bbox'}
-    """
-
-    rectangular_holes = []
-    explorer = TopExp_Explorer(shape, TopAbs_FACE)
-    while explorer.More():
-        face = topods.Face(explorer.Current())
-        adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
-        if adaptor.GetType() != GeomAbs_Plane:
-            explorer.Next()
-            continue
-        # Ignora faces circulares
-        outer_wire = breptools.OuterWire(face)
-        vertex_explorer = TopExp_Explorer(outer_wire, TopAbs_VERTEX)
-        vertices = []
-        while vertex_explorer.More():
-            vertex = topods.Vertex(vertex_explorer.Current())
-            pnt = BRep_Tool.Pnt(vertex)
-            vertices.append((pnt.X(), pnt.Y(), pnt.Z()))
-            vertex_explorer.Next()
-        if len(vertices) < 3:
-            explorer.Next()
-            continue
-        # Testa se é circular
-        cx = sum(v[0] for v in vertices) / len(vertices)
-        cy = sum(v[1] for v in vertices) / len(vertices)
-        cz = sum(v[2] for v in vertices) / len(vertices)
-        radii = [math.sqrt((v[0] - cx) ** 2 + (v[1] - cy) ** 2 + (v[2] - cz) ** 2) for v in vertices]
-        avg_radius = sum(radii) / len(radii)
-        if all(abs(r - avg_radius) < tol_circular for r in radii):
-            explorer.Next()
-            continue  # ignora círculos
-        # Calcula bounding box
-        bbox = Bnd_Box()
-        brepbndlib.Add(face, bbox)
-        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-        dx = abs(xmax - xmin)
-        dy = abs(ymax - ymin)
-        dz = abs(zmax - zmin)
-        # Centro
-        center = ((xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2)
-        # Guarda info
-        rectangular_holes.append({
-            'length': round(max(dx, dy), 2),
-            'width': round(min(dx, dy), 2),
-            'height': round(dz, 2),
-            'center': tuple(round(c, 2) for c in center),
-            'bbox': (xmin, ymin, zmin, xmax, ymax, zmax)
-        })
-        explorer.Next()
-    return rectangular_holes
 
 def get_all_radii_of_group(faces, min_allowed=3.0):
     """
@@ -867,64 +808,6 @@ def get_circular_hole_diameters_by_type(shape):
 
 # ======================================================================================================================
 
-# Nova função: extrai furos retangulares usando bounding box das faces não circulares
-def extract_rectangular_holes_by_bbox(shape, tol_circular=0.5):
-    """
-    Extrai furos retangulares (ou qualquer furo não circular) usando bounding box das faces planas não circulares.
-    Para cada face plana não circular:
-      - Calcula bounding box
-      - Extrai largura, comprimento, altura e centro
-      - Ignora faces circulares
-    Retorna lista de dicts: {'length', 'width', 'height', 'center', 'bbox'}
-    """
-    rectangular_holes = []
-    explorer = TopExp_Explorer(shape, TopAbs_FACE)
-    while explorer.More():
-        face = topods.Face(explorer.Current())
-        adaptor = GeomAdaptor_Surface(BRep_Tool.Surface(face))
-        if adaptor.GetType() != GeomAbs_Plane:
-            explorer.Next()
-            continue
-        # Obtém vértices do contorno
-        outer_wire = breptools.OuterWire(face)
-        vertex_explorer = TopExp_Explorer(outer_wire, TopAbs_VERTEX)
-        vertices = []
-        while vertex_explorer.More():
-            vertex = topods.Vertex(vertex_explorer.Current())
-            pnt = BRep_Tool.Pnt(vertex)
-            vertices.append((pnt.X(), pnt.Y(), pnt.Z()))
-            vertex_explorer.Next()
-        if len(vertices) < 3:
-            explorer.Next()
-            continue
-        # Testa se é uma circunferência isolada (todos os vértices equidistantes do centro e pelo menos 5 vértices)
-        cx = sum(v[0] for v in vertices) / len(vertices)
-        cy = sum(v[1] for v in vertices) / len(vertices)
-        cz = sum(v[2] for v in vertices) / len(vertices)
-        radii = [math.sqrt((v[0] - cx) ** 2 + (v[1] - cy) ** 2 + (v[2] - cz) ** 2) for v in vertices]
-        avg_radius = sum(radii) / len(radii)
-        # Se todos os vértices equidistantes do centro E tem pelo menos 5 vértices, é círculo isolado
-        if len(vertices) >= 5 and all(abs(r - avg_radius) < tol_circular for r in radii):
-            explorer.Next()
-            continue  # ignora círculos isolados
-        # Caso contrário, pode ser contorno misto (retângulo com arco/círculo)
-        bbox = Bnd_Box()
-        brepbndlib.Add(face, bbox)
-        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-        dx = abs(xmax - xmin)
-        dy = abs(ymax - ymin)
-        dz = abs(zmax - zmin)
-        center = ((xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2)
-        rectangular_holes.append({
-            'length': round(max(dx, dy), 2),
-            'width': round(min(dx, dy), 2),
-            'height': round(dz, 2),
-            'center': tuple(round(c, 2) for c in center),
-            'bbox': (xmin, ymin, zmin, xmax, ymax, zmax)
-        })
-        explorer.Next()
-    return rectangular_holes
-
 # Função: retorna todas as faces planas (inclusive circulares) com bbox e medidas
 def get_all_planar_faces_bbox(shape):
     """
@@ -968,40 +851,4 @@ def get_all_planar_faces_bbox(shape):
         explorer.Next()
     return result
 
-def group_faces_by_topology(shape):
-    # Novo agrupamento por conectividade de vértices (x1,y1) == (x2,y2) de outra face
-    explorer = TopExp_Explorer(shape, TopAbs_FACE)
-    face_bboxes = []
-    while explorer.More():
-        face = explorer.Current()
-        bbox = Bnd_Box()
-        brepbndlib.Add(face, bbox)
-        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-        face_bboxes.append({
-            'face': face,
-            'bbox': (xmin, ymin, zmin, xmax, ymax, zmax)
-        })
-        explorer.Next()
-
-    # Agrupamento: cada grupo contém faces conectadas por (x1,y1) == (x2,y2) de outra
-    grupos = []
-    usados = set()
-    for i, f1 in enumerate(face_bboxes):
-        if i in usados:
-            continue
-        grupo = [f1['face']]
-        usados.add(i)
-        x1_1, y1_1 = round(f1['bbox'][0], 5), round(f1['bbox'][1], 5)
-        x2_1, y2_1 = round(f1['bbox'][3], 5), round(f1['bbox'][4], 5)
-        for j, f2 in enumerate(face_bboxes):
-            if j == i or j in usados:
-                continue
-            x1_2, y1_2 = round(f2['bbox'][0], 5), round(f2['bbox'][1], 5)
-            x2_2, y2_2 = round(f2['bbox'][3], 5), round(f2['bbox'][4], 5)
-            # Se (x1_1, y1_1) == (x2_2, y2_2) ou (x2_1, y2_1) == (x1_2, y1_2), agrupa
-            if (x1_1 == x2_2 and y1_1 == y2_2) or (x2_1 == x1_2 and y2_1 == y1_2):
-                grupo.append(f2['face'])
-                usados.add(j)
-        grupos.append(grupo)
-    return grupos
 # ----------------------------------------------------------------------------------------------------------------------
