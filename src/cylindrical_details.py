@@ -5,7 +5,6 @@ from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_VERTEX
 from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone
 from collections import defaultdict, Counter
-from .utils import axis_key, get_circular_hole_diameters_by_type
 
 def group_faces_by_axis(shape):
     """

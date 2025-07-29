@@ -1,5 +1,4 @@
 from collections import Counter
-from .utils import group_non_circular_planar_faces, auto_filter_rectangular_faces, get_piece_dimensions, find_slots, get_bbox, is_open_edge
 
 def show_rectangular_details(shape):
     """

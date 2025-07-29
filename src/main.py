@@ -1,6 +1,6 @@
 from .loader import load_step_file, choose_file_from_folder 
 from .main_details import show_general_summary
-from .cylindrical_details import get_circular_hole_diameters_by_type, show_circular_hole_details
+from .cylindrical_details import show_circular_hole_details
 from .rectangular_details import show_rectangular_details
 from .semi_circular_details import show_semi_circular_details
 
@@ -15,7 +15,7 @@ def main():
     if not shape or shape.IsNull():
         print("Erro: shape inválido ou ficheiro STEP corrompido.")
         return
-
+    
     while True:
         print("\n=== MENU PRINCIPAL ===")
         print("1 - Resumo da peça para o GESTi")
@@ -25,13 +25,16 @@ def main():
         print("5 - Escolher outro ficheiro")
         print("0 - Sair")
 
+        if shape.ShapeType() != "Solid":
+            show_general_summary(shape, filepath)
+        break
+
         opcao = input("Escolha uma opção: ").strip()
 
         if opcao == "1":
             show_general_summary(shape, filepath)
 
         elif opcao == "2":
-            diameters_through, diameters_closed = get_circular_hole_diameters_by_type(shape)
             show_circular_hole_details(diameters_through, diameters_closed)
 
         elif opcao == "3":
