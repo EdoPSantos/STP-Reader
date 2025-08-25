@@ -15,20 +15,11 @@ __pycache__/
 .vscode/
 .idea/
 
-# Ficheiros STEP e outros CAD de entrada (devem ser colocados localmente)
-stp_igs_files/*.stp
-stp_igs_files/*.step
-stp_igs_files/*.iges
-stp_igs_files/*.igs
-
-# Ficheiros de imagem (ex: screenshots)
-screenshots/
-*.png
-*.jpg
-*.jpeg
-*.gif
-
 # Outros (Windows)
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+excels/
+docs/
+stp_igs_files/

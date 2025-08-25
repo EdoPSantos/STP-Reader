@@ -16,19 +16,27 @@ def load_step_file(filename):
 
 # Função para permitir seleção do ficheiro no terminal
 def choose_file_from_folder(folder):
-    files = [f for f in os.listdir(folder) if f.lower().endswith('.stp')]
+    files = [f for f in os.listdir(folder) if f.lower().endswith(('.stp', '.step', '.igs'))]
     if not files:
-        print("Nenhum ficheiro .stp encontrado na pasta.")
+        print("Nenhum ficheiro .stp/.step/.igs encontrado na pasta.")
         return None
 
-    print("Escolha um ficheiro .stp:")
+    print("Escolha um ficheiro .stp/.step/.igs:")
     for i, f in enumerate(files):
         print(f"{i+1}: {f}")
+    print("a: Processar TODOS os ficheiros")
 
     while True:
-        choice = input("Número do ficheiro: ")
-        if choice.isdigit():
+        choice = input("Número do ficheiro ou 'a' para todos: ").strip().lower()
+        if choice == 'a':
+            return 'ALL'
+        elif choice.isdigit():
             choice = int(choice)
             if 1 <= choice <= len(files):
                 return os.path.join(folder, files[choice - 1])
         print("Escolha inválida. Tente novamente.")
+
+def get_all_files_from_folder(folder):
+    """Retorna lista de todos os ficheiros .stp/.step/.igs na pasta"""
+    files = [f for f in os.listdir(folder) if f.lower().endswith(('.stp', '.step', '.igs'))]
+    return [os.path.join(folder, f) for f in files]
