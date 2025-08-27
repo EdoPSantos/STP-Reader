@@ -320,25 +320,26 @@ def _format_circular_subgroups(features_detalhadas: List[Dict[str, Any]]) -> Lis
         if info['direcoes']:
             direcoes_count = {}
             for dir in info['direcoes']:
-                direcoes_count[dir] = direcoes_count.get(dir, 0) + 1
-            
+                # Substituir setas por números
+                dir_num = dir.replace("↑", "1").replace("↓", "2")
+                direcoes_count[dir_num] = direcoes_count.get(dir_num, 0) + 1
             if len(direcoes_count) == 1:
                 dir_symbol = list(direcoes_count.keys())[0]
                 line += f"\n       Direção: {dir_symbol}"
             else:
                 dir_info = []
-                total_down = direcoes_count.get("↓", 0)
-                total_up = direcoes_count.get("↑", 0)
-                if total_down >= total_up:
-                    if total_down > 0:
-                        dir_info.append(f"{total_down}×↓")
-                    if total_up > 0:
-                        dir_info.append(f"{total_up}×↑")
+                total_1 = direcoes_count.get("1", 0)
+                total_2 = direcoes_count.get("2", 0)
+                if total_2 >= total_1:
+                    if total_2 > 0:
+                        dir_info.append(f"{total_2}×2")
+                    if total_1 > 0:
+                        dir_info.append(f"{total_1}×1")
                 else:
-                    if total_up > 0:
-                        dir_info.append(f"{total_up}×↑")
-                    if total_down > 0:
-                        dir_info.append(f"{total_down}×↓")
+                    if total_1 > 0:
+                        dir_info.append(f"{total_1}×1")
+                    if total_2 > 0:
+                        dir_info.append(f"{total_2}×2")
                 line += f"\n       Direção: {' + '.join(dir_info)}"
         
         output.append(line)
@@ -464,37 +465,65 @@ def _format_single_rectangular_hole(grupo: Dict[str, Any], index: int, shape, al
     """Formata um único furo retangular."""
     comprimento = grupo['comprimento']
     largura = grupo['largura']
-    
-    # Calcular profundidade e tipo (lógica simplificada)
+
+    # Calcular profundidade correta: diferença entre menor e maior valor de Z das faces
     profundidade = altura_chapa
     tipo = "passante"
     direcao = ""
-    
-    # Análise básica de tipo baseado nas faces
+
+    # Calcular profundidade real usando Z das faces
+    z_values = []
     if 'faces' in grupo and grupo['faces']:
-        # Lógica simplificada - pode ser expandida conforme necessário
         faces_group = grupo['faces']
-        if isinstance(faces_group, list) and len(faces_group) > 0:
-            primeiro_item = faces_group[0]
-            if isinstance(primeiro_item, dict) and 'height' in primeiro_item:
-                # Calcular com base nos metadados
-                alturas_elementos = [item['height'] for item in faces_group if item.get('height', 0) > 0.1]
-                if alturas_elementos:
-                    altura_maxima = max(alturas_elementos)
-                    if altura_maxima < altura_chapa * 0.95:
-                        tipo = "cego"
-                        profundidade = round(altura_maxima, 1)
-                        direcao = " ↓"  # Assumir direção padrão
-    
-    # Formatar saída principal
-    tipo_completo = f"{tipo}{direcao}" if direcao else tipo
-    output = f"  Furo {index}: {comprimento:.1f} x {largura:.1f} mm - Profundidade: {profundidade:.1f} mm - Tipo: {tipo_completo}"
-    
+        for face in faces_group:
+            # Tenta usar bbox se disponível, senão usa center Z
+            if 'bbox' in face and isinstance(face['bbox'], (list, tuple)) and len(face['bbox']) == 6:
+                z_values.append(face['bbox'][2])  # zmin
+                z_values.append(face['bbox'][5])  # zmax
+            elif 'center' in face and isinstance(face['center'], (list, tuple)) and len(face['center']) == 3:
+                z_values.append(face['center'][2])
+    if z_values:
+        profundidade = round(abs(max(z_values) - min(z_values)), 2)
+        tolerancia = 0.1
+        # Obter limites reais da chapa
+        bbox_chapa = None
+        if hasattr(shape, 'BoundingBox'):
+            try:
+                bbox_chapa = get_bbox(shape)
+            except Exception:
+                bbox_chapa = None
+        elif 'bbox' in grupo:
+            bbox_chapa = grupo['bbox']
+        if bbox_chapa:
+            zmin_chapa = bbox_chapa[2]
+            zmax_chapa = bbox_chapa[5]
+        else:
+            zmin_chapa = 0
+            zmax_chapa = altura_chapa
+        if profundidade < (zmax_chapa - zmin_chapa - tolerancia):
+            tipo = "cego"
+            zmin = min(z_values)
+            zmax = max(z_values)
+            if abs(zmin - zmin_chapa) < tolerancia:
+                direcao = "1"  # baixo
+            elif abs(zmax - zmax_chapa) < tolerancia:
+                direcao = "2"  # cima
+            else:
+                direcao = ""
+        else:
+            tipo = "passante"
+            direcao = ""
+
+    tipo_completo = tipo
+    output = f"  Furo {index}: {comprimento:.1f} x {largura:.1f} mm - Profundidade: {profundidade:.2f} mm - Tipo: {tipo_completo}"
+    if direcao:
+        output += f" | Direção: {direcao}"
+
     # Adicionar detalhes das faces se disponível
     faces_details = _format_rectangular_face_details(grupo)
     if faces_details:
         output += "\n" + faces_details
-    
+
     return output
 
 def _format_rectangular_face_details(grupo: Dict[str, Any]) -> str:
@@ -609,18 +638,7 @@ def _group_faces_by_orientation(faces_agrupadas: Dict, hole_bbox=None) -> Dict[s
             # Adicionar informações de diâmetro para faces cilíndricas
             if face['type'] == 'cilindro' and 'diameter' in face:
                 descricao += f" - Diâmetro: {face['diameter']:.2f} mm"
-            # Adicionar informações de diâmetro para faces cônicas
-            if face['type'] == 'cone' and 'ref_diameter' in face:
-                descricao += f" - Diâmetro base: {face['ref_diameter']:.2f} mm"
-            # Adicionar label de posição para cilindros e cones
-            if face['type'] in ['cilindro', 'cone'] and 'center' in face:
-                # Lógica estrita: centro deve estar estritamente dentro dos limites
-                xmin, ymin, zmin, xmax, ymax, zmax = hole_bbox if hole_bbox else (None, None, None, None, None, None)
-                fx, fy, fz = face['center']
-                if hole_bbox and (xmin < fx < xmax and ymin < fy < ymax):
-                    descricao += " (In)"
-                else:
-                    descricao += " (Out)"
+            # Não exibir diâmetro para faces cônicas
             faces_por_orientacao[angle_word].append({
                 'descricao': descricao,
                 'count': 1
@@ -632,16 +650,7 @@ def _group_faces_by_orientation(faces_agrupadas: Dict, hole_bbox=None) -> Dict[s
             primeira_face = faces_do_grupo[0]
             if tipo == 'cilindro' and 'diameter' in primeira_face:
                 descricao += f" - Diâmetro: {primeira_face['diameter']:.2f} mm"
-            if tipo == 'cone' and 'ref_diameter' in primeira_face:
-                descricao += f" - Diâmetro base: {primeira_face['ref_diameter']:.2f} mm"
-            # Adicionar label de posição se disponível
-            if tipo in ['cilindro', 'cone'] and 'center' in primeira_face:
-                xmin, ymin, zmin, xmax, ymax, zmax = hole_bbox if hole_bbox else (None, None, None, None, None, None)
-                fx, fy, fz = primeira_face['center']
-                if hole_bbox and (xmin < fx < xmax and ymin < fy < ymax):
-                    descricao += " (In)"
-                else:
-                    descricao += " (Out)"
+            # Não exibir diâmetro para grupos de faces cônicas
             faces_por_orientacao[angle_word].append({
                 'descricao': descricao,
                 'count': len(faces_do_grupo)
@@ -666,29 +675,84 @@ def generate_full_report(summary: Dict[str, Any], shape) -> str:
     """
     output_parts = []
     
-    # Cabeçalho
-    header = format_piece_header(summary)
-    output_parts.append(header)
-    
     # Furos circulares
     circular_text, todas_direcoes_globais = format_circular_holes(summary, shape, summary.get('hole_groups', []))
     output_parts.append(circular_text)
-    
-    # Posição da chapa baseada nas direções
-    position_text = format_piece_position(todas_direcoes_globais)
-    output_parts.append(position_text)
-    output_parts.append("\n" + "-" * 40)
-    
+
     # Furos semicirculares
     semicircular_text = format_semicircular_holes(summary, shape)
     output_parts.append(semicircular_text)
+
+    # Linha separadora entre semicirculares e retangulares
     output_parts.append("\n" + "-" * 40)
-    
+
     # Furos retangulares
     rectangular_text = format_rectangular_holes(summary, shape)
     output_parts.append(rectangular_text)
-    
+
+
+    # Coletar direções exibidas dos furos circulares
+    direcoes_circulares_exibidas = []
+    circ_counter = summary.get('circ_counter', {})
+    unique_circ_list = summary.get('unique_circ_list', [])
+    if circ_counter:
+        for (min_d, max_d), count_from_counter in circ_counter.items():
+            grupo_feats = [feat for feat in unique_circ_list if round(feat['min_d'], 1) == min_d and round(feat['max_d'], 1) == max_d]
+            for feat in grupo_feats:
+                # Só adicionar se realmente tem direção e será exibida
+                if 'direcao' in feat and feat['direcao']:
+                    dir_num = feat['direcao'].replace("↑", "1").replace("↓", "2")
+                    direcoes_circulares_exibidas.append(dir_num)
+
+    # Coletar direções exibidas dos furos retangulares
+    direcoes_retangulares_exibidas = []
+    rectangular_counter = summary.get('rectangular_counter', [])
+    for grupo in rectangular_counter:
+        # Replicar lógica de _format_single_rectangular_hole para extrair direção
+        z_values = []
+        if 'faces' in grupo and grupo['faces']:
+            faces_group = grupo['faces']
+            for face in faces_group:
+                if 'bbox' in face and isinstance(face['bbox'], (list, tuple)) and len(face['bbox']) == 6:
+                    z_values.append(face['bbox'][2])
+                    z_values.append(face['bbox'][5])
+                elif 'center' in face and isinstance(face['center'], (list, tuple)) and len(face['center']) == 3:
+                    z_values.append(face['center'][2])
+        if z_values:
+            tolerancia = 0.1
+            bbox_chapa = None
+            if 'bbox' in grupo:
+                bbox_chapa = grupo['bbox']
+            if bbox_chapa:
+                zmin_chapa = bbox_chapa[2]
+                zmax_chapa = bbox_chapa[5]
+            else:
+                zmin_chapa = 0
+                zmax_chapa = summary.get('bbox', [0,0,0,0,0,0])[5]
+            profundidade = round(abs(max(z_values) - min(z_values)), 2)
+            if profundidade < (zmax_chapa - zmin_chapa - tolerancia):
+                zmin = min(z_values)
+                zmax = max(z_values)
+                if abs(zmin - zmin_chapa) < tolerancia:
+                    direcoes_retangulares_exibidas.append("1")
+                elif abs(zmax - zmax_chapa) < tolerancia:
+                    direcoes_retangulares_exibidas.append("2")
+
+    # Unir todas direções exibidas dos furos circulares e retangulares
+    todas_direcoes_exibidas = direcoes_circulares_exibidas + direcoes_retangulares_exibidas
+    direcoes_unicas = set([d for d in todas_direcoes_exibidas if d])
+    summary['positions'] = len(direcoes_unicas) if direcoes_unicas else 1
+
+    # Cabeçalho
+    header = format_piece_header(summary)
+    output_parts.insert(0, header)
+
+    # Posição da chapa baseada nas direções exibidas
+    position_text = format_piece_position(todas_direcoes_exibidas)
+    output_parts.insert(2, position_text)
+    output_parts.insert(3, "\n" + "-" * 40)
+
     # Rodapé
     output_parts.append("\n" + "=" * 40)
-    
+
     return "\n".join(output_parts)
