@@ -257,21 +257,39 @@ def _analyze_geometric_components(feat: Dict[str, Any], eh_furo_escalonado: bool
     """Analisa componentes geométricos e determina direção."""
     components_info = []
     direcao = None
-    
+
+    # Agrupar componentes consecutivos do mesmo tipo e diâmetro/intervalo
     if 'geometric_components' in feat and feat['geometric_components']:
+        grouped = []
+        prev = None
         for component in feat['geometric_components']:
+            key = None
             if component['geometric_type'] == 'cilindrica':
-                components_info.append(f"Cilíndrico ⌀{component['diameter']:.1f}mm h{component['altura']:.1f}mm")
+                key = ('cilindrica', round(component['diameter'], 2))
             elif component['geometric_type'] == 'conica':
-                components_info.append(f"Cônico ⌀{component['diameter_min']:.1f}-{component['diameter_max']:.1f}mm h{component['altura']:.1f}mm")
-                
-                if eh_furo_escalonado or tipo == "cego":
-                    if 'direction' in component and direcao is None:
-                        if component['direction'] == 'expanding':
-                            direcao = "↓"
-                        elif component['direction'] == 'contracting':
-                            direcao = "↑"
-    
+                key = ('conica', round(component['diameter_min'], 2), round(component['diameter_max'], 2))
+            if prev and key == prev['key']:
+                prev['altura'] += component['altura']
+            else:
+                prev = {'key': key, 'type': component['geometric_type'], 'diameter': component.get('diameter'),
+                        'diameter_min': component.get('diameter_min'), 'diameter_max': component.get('diameter_max'),
+                        'altura': component['altura']}
+                grouped.append(prev)
+            # Direção
+            if component['geometric_type'] == 'conica' and (eh_furo_escalonado or tipo == "cego"):
+                if 'direction' in component and direcao is None:
+                    if component['direction'] == 'expanding':
+                        direcao = "↓"
+                    elif component['direction'] == 'contracting':
+                        direcao = "↑"
+
+        # Gerar info consolidada
+        for g in grouped:
+            if g['type'] == 'cilindrica':
+                components_info.append(f"Cilíndrico ⌀{g['key'][1]:.1f}mm h{g['altura']:.1f}mm")
+            elif g['type'] == 'conica':
+                components_info.append(f"Cônico ⌀{g['key'][1]:.1f}-{g['key'][2]:.1f}mm h{g['altura']:.1f}mm")
+
     # Determinar direção para furos cegos baseado na posição Z
     if tipo == "cego" and 'coordinates' in feat and feat['coordinates']:
         coords = feat['coordinates']
@@ -282,7 +300,7 @@ def _analyze_geometric_components(feat: Dict[str, Any], eh_furo_escalonado: bool
                 direcao = "↓"
             else:
                 direcao = "↑"
-    
+
     return components_info, direcao
 
 def _format_circular_subgroups(features_detalhadas: List[Dict[str, Any]]) -> List[str]:
