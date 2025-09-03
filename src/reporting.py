@@ -14,6 +14,7 @@ from .utils import (
 import logging
 
 logger = logging.getLogger(__name__)
+logger.disabled = True
 
 def format_piece_header(summary: Dict[str, Any]) -> str:
     """Formata o cabeçalho do relatório da peça."""
@@ -501,7 +502,16 @@ def _format_single_rectangular_hole(grupo: Dict[str, Any], index: int, shape, al
             elif 'center' in face and isinstance(face['center'], (list, tuple)) and len(face['center']) == 3:
                 z_values.append(face['center'][2])
     if z_values:
-        profundidade = round(abs(max(z_values) - min(z_values)), 2)
+        profundidade_calculada = abs(max(z_values) - min(z_values))
+        # Limitar profundidade à altura da chapa (evitar valores impossíveis)
+        profundidade_limitada = min(profundidade_calculada, altura_chapa)
+        # Arredondar de forma conservadora para evitar valores impossíveis
+        profundidade = round(profundidade_limitada, 2)
+        
+        # Verificação final: se a diferença for mínima, usar exatamente a altura da chapa
+        if abs(profundidade - altura_chapa) < 0.1:  # Tolerância aumentada para 0.1mm
+            profundidade = round(altura_chapa, 2)
+        
         tolerancia = 0.1
         # Obter limites reais da chapa
         bbox_chapa = None

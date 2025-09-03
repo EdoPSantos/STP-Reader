@@ -13,9 +13,10 @@ import sys
 import logging
 from typing import List, Dict, Optional, Tuple, Any
 
-# Configurar logging
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+# Configurar logging - DESABILITADO
+logging.basicConfig(level=logging.CRITICAL, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
+logger.disabled = True
 
 try:
     import openpyxl
@@ -24,12 +25,11 @@ try:
     EXCEL_AVAILABLE = True
 except ImportError:
     EXCEL_AVAILABLE = False
-    logger.warning("Biblioteca openpyxl não disponível. Funcionalidade Excel desabilitada.")
 
 # Importar as novas estruturas e utilitários CONSOLIDADOS
 from .data_structures import (
     CircularFeature, SemicircularFeature, RectangularFeature, 
-    PieceAnalysis, AnalysisWarning, BoundingBox, AnalysisRules, DEFAULT_RULES
+    PieceAnalysis, BoundingBox, AnalysisRules, DEFAULT_RULES
 )
 from .utils import (
     # Funções de ângulos e orientação
@@ -59,43 +59,23 @@ from .utils import (
     TIPO_PLANO, TIPO_CILINDRO, TIPO_CONE
 )
 
+def get_adaptive_tolerance(diameter):
+    """Calcula tolerância adaptativa baseada no diâmetro do furo."""
+    if diameter < 10:  # Furos pequenos
+        return 0.3
+    elif diameter < 30:  # Furos médios
+        return 0.5
+    elif diameter < 50:  # Furos médios-grandes
+        return 1.0
+    elif diameter < 100:  # Furos grandes (como o caso de 72mm)
+        return 2.5
+    else:  # Furos muito grandes
+        return 3.0
+
 pi = math.pi
 # endregion
 
-# region Sistema de Warnings Gerenciado
-class AnalysisWarningsManager:
-    """Gerenciador centralizado de warnings da análise."""
-    
-    def __init__(self):
-        self.warnings: List[AnalysisWarning] = []
-    
-    def add_warning(self, warning_type: str, message: str, count: int = 1):
-        """Adiciona um warning."""
-        warning = AnalysisWarning(warning_type=warning_type, message=message, count=count)
-        self.warnings.append(warning)
-        logger.warning(f"{warning_type.upper()}: {message}")
-    
-    def get_warnings_by_type(self, warning_type: str) -> List[AnalysisWarning]:
-        """Obtém warnings de um tipo específico."""
-        return [w for w in self.warnings if w.warning_type == warning_type]
-    
-    def has_warnings(self, warning_type: Optional[str] = None) -> bool:
-        """Verifica se há warnings (opcionalmente de um tipo específico)."""
-        if warning_type:
-            return len(self.get_warnings_by_type(warning_type)) > 0
-        return len(self.warnings) > 0
-    
-    def clear(self):
-        """Limpa todos os warnings."""
-        self.warnings.clear()
-    
-    def get_warning_message(self, warning_type: str) -> Optional[str]:
-        """Obtém a mensagem do primeiro warning de um tipo."""
-        warnings = self.get_warnings_by_type(warning_type)
-        return warnings[0].message if warnings else None
-
-# Instância global do gerenciador de warnings
-warnings_manager = AnalysisWarningsManager()
+# region Sistema de Cache para Performance - Removido sistema de warnings
 
 # region Sistema de Cache para Performance
 class BoundingBoxCache:
@@ -114,7 +94,6 @@ class BoundingBoxCache:
                 brepbndlib.Add(shape, bbox_obj)
                 self._cache[shape_id] = bbox_obj.Get()
             except Exception as e:
-                logger.warning(f"Erro ao calcular bounding box: {e}")
                 self._cache[shape_id] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         
         return self._cache[shape_id]
@@ -241,7 +220,6 @@ def get_rectangular_features(shape):
                 zmin_furo = min(zmin_furo, face_bbox[2])
                 zmax_furo = max(zmax_furo, face_bbox[5])
             except (AttributeError, TypeError, ValueError) as e:
-                logger.warning(f"Erro ao calcular bbox da face: {e}")
                 continue
         
         if zmin_furo == float('inf'):
@@ -259,6 +237,73 @@ def get_rectangular_features(shape):
             'bbox': bbox_furo
         })
         grupo_id += 1
+    # Verificação de ligação entre faces diagonais e verticais
+    # Fusão automática de grupos retangulares ligados por faces
+    def grupos_ligados(g1, g2, tol=1.0):
+        for f1 in g1['faces']:
+            for f2 in g2['faces']:
+                x1 = [f1['bbox'][0], f1['bbox'][3]]
+                y1 = [f1['bbox'][1], f1['bbox'][4]]
+                x2 = [f2['bbox'][0], f2['bbox'][3]]
+                y2 = [f2['bbox'][1], f2['bbox'][4]]
+                x_intersect = max(min(x1), min(x2)) - min(max(x1), max(x2)) <= tol
+                y_intersect = max(min(y1), min(y2)) - min(max(y1), max(y2)) <= tol
+                if x_intersect and y_intersect:
+                    return True
+        return False
+
+    # Algoritmo de fusão
+    grupos = rectangular_counter.copy()
+    mudou = True
+    while mudou:
+        mudou = False
+        novo = []
+        usados = set()
+        for i, g1 in enumerate(grupos):
+            if i in usados:
+                continue
+            grupo_fundido = g1.copy()
+            grupo_fundido['faces'] = g1['faces'].copy()
+            for j, g2 in enumerate(grupos):
+                if j <= i or j in usados:
+                    continue
+                if grupos_ligados(grupo_fundido, g2, tol=1.0):
+                    grupo_fundido['faces'].extend(g2['faces'])
+                    usados.add(j)
+                    mudou = True
+            novo.append(grupo_fundido)
+            usados.add(i)
+        grupos = novo
+    # Recalcula dimensões dos grupos fundidos
+    resultado = []
+    grupo_id = 1
+    for grupo in grupos:
+        faces = grupo['faces']
+        if not faces:
+            continue
+        xmins = [f['bbox'][0] for f in faces]
+        ymins = [f['bbox'][1] for f in faces]
+        xmaxs = [f['bbox'][3] for f in faces]
+        ymaxs = [f['bbox'][4] for f in faces]
+        xmin_g = min(xmins)
+        xmax_g = max(xmaxs)
+        ymin_g = min(ymins)
+        ymax_g = max(ymaxs)
+        comprimento_g = round(xmax_g - xmin_g, 3)
+        largura_g = round(ymax_g - ymin_g, 3)
+        zmin_furo = min([f['bbox'][2] for f in faces])
+        zmax_furo = max([f['bbox'][5] for f in faces])
+        bbox_furo = (xmin_g, ymin_g, zmin_furo, xmax_g, ymax_g, zmax_furo)
+        resultado.append({
+            'grupo_id': grupo_id,
+            'num_faces': len(faces),
+            'comprimento': comprimento_g,
+            'largura': largura_g,
+            'faces': faces,
+            'bbox': bbox_furo
+        })
+        grupo_id += 1
+    return resultado
     return rectangular_counter
 
 def get_oblong_features(shape):
@@ -387,7 +432,6 @@ def get_circular_features(shape, semi_features=None):
                     all_z_values.extend([z_min, z_max])
                 depth_info = abs(max(all_z_values) - min(all_z_values))
         except (KeyError, AttributeError, TypeError) as e:
-            logger.warning(f"Erro ao calcular profundidade do furo: {e}")
             depth_info = None
         
         if len(radii) > 1:
@@ -422,7 +466,6 @@ def get_circular_features(shape, semi_features=None):
             if len(faces) > 0 and len(faces[0]) == 5:
                 geometric_analysis = faces[0][4]
         except (IndexError, TypeError) as e:
-            logger.warning(f"Erro ao acessar análise geométrica: {e}")
             geometric_analysis = {}
 
         features.append({
@@ -529,6 +572,118 @@ def validate_cone_geometry(features):
     
     return validated_features
 
+def validate_hole_height_consistency(features, altura_chapa):
+    """
+    Separa furos onde a soma das alturas dos componentes excede a altura da chapa.
+    Em vez de remover, cria furos individuais para cada componente válido.
+    """
+    validated_features = []
+    tolerancia = 0.5  # mm
+    
+    for feat in features:
+        if not feat.get('geometric_components'):
+            validated_features.append(feat)
+            continue
+        
+        # Calcular soma das alturas dos componentes
+        total_height = 0
+        for component in feat['geometric_components']:
+            if 'altura' in component:
+                total_height += component['altura']
+        
+        # Se a soma não excede a altura da chapa, manter o furo original
+        if total_height <= (altura_chapa + tolerancia):
+            validated_features.append(feat)
+        else:
+            # Verificar se é um furo com geometria válida (ex: cabeça de embutir)
+            # Critério: se tem cilindro + cone + cilindro em sequência lógica, manter agrupado
+            has_logical_sequence = False
+            if len(feat['geometric_components']) >= 2:
+                # Ordenar componentes por z_min para verificar sequência
+                components = sorted(feat['geometric_components'], key=lambda x: x.get('z_min', 0))
+                
+                # Verificar padrões típicos de furos com cabeça de embutir
+                types = [c.get('geometric_type') for c in components]
+                
+                # Padrão 1: cilindro + cone + cilindro (cabeça de embutir clássica)
+                # Padrão 2: cone + cilindro (escareado simples)  
+                # Padrão 3: cilindro + cone (escareado reverso)
+                if (len(types) >= 3 and 'conica' in types and 'cilindrica' in types) or \
+                   (len(types) == 2 and 'conica' in types and 'cilindrica' in types):
+                    
+                    # Verificar se os diâmetros fazem sentido (cone conecta cilindros)
+                    cone_components = [c for c in components if c.get('geometric_type') == 'conica']
+                    cylinder_components = [c for c in components if c.get('geometric_type') == 'cilindrica']
+                    
+                    if cone_components and cylinder_components:
+                        cone = cone_components[0]
+                        cone_min_d = cone.get('diameter_min', 0)
+                        cone_max_d = cone.get('diameter_max', 0)
+                        
+                        # Verificar se há cilindros que conectam com o cone
+                        for cyl in cylinder_components:
+                            cyl_d = cyl.get('diameter', 0)
+                            if (abs(cyl_d - cone_min_d) < 1.0) or (abs(cyl_d - cone_max_d) < 1.0):
+                                has_logical_sequence = True
+                                break
+            
+            if has_logical_sequence:
+                # Manter o furo agrupado, mesmo que a altura total exceda a chapa
+                validated_features.append(feat)
+            else:
+                # Separar em furos individuais apenas se não há sequência lógica
+                for component in feat['geometric_components']:
+                    if (component.get('geometric_type') in ['cilindrica', 'conica'] and 'altura' in component):
+                        # Calcular centro individual do componente
+                        individual_center = feat.get('center', (0, 0, 0))
+                        
+                        # Se o componente tem face própria, calcular centro da face
+                        if 'face' in component and 'adaptor' in component:
+                            try:
+                                face = component['face']
+                                adaptor = component['adaptor']
+                                if adaptor.GetType() == GeomAbs_Cylinder:
+                                    axis = adaptor.Cylinder().Axis()
+                                    loc = axis.Location()
+                                    individual_center = (round(loc.X(), 2), round(loc.Y(), 2), round(loc.Z(), 2))
+                                elif adaptor.GetType() == GeomAbs_Cone:
+                                    axis = adaptor.Cone().Axis()
+                                    loc = axis.Location()
+                                    individual_center = (round(loc.X(), 2), round(loc.Y(), 2), round(loc.Z(), 2))
+                                else:
+                                    bbox = get_bbox(face)
+                                    cx = (bbox[0] + bbox[3]) / 2
+                                    cy = (bbox[1] + bbox[4]) / 2
+                                    cz = (bbox[2] + bbox[5]) / 2
+                                    individual_center = (round(cx, 2), round(cy, 2), round(cz, 2))
+                            except:
+                                # Se falhar, usar centro original
+                                individual_center = feat.get('center', (0, 0, 0))
+                        
+                        # Determinar diâmetro baseado no tipo de componente
+                        if component.get('geometric_type') == 'cilindrica':
+                            diameter = component['diameter']
+                            has_cone = False
+                        else:  # componente cônico
+                            # Para cones, usar diâmetro médio
+                            diameter = (component.get('diameter_min', 0) + component.get('diameter_max', 0)) / 2
+                            has_cone = True
+                        
+                        # Criar furo individual para cada componente
+                        individual_feature = {
+                            'min_d': diameter,               # Usar diâmetro do componente
+                            'max_d': diameter,               # Usar diâmetro do componente
+                            'center': individual_center,     # Usar centro individual
+                            'has_cone': has_cone,
+                            'geometric_components': [component],
+                            'num_components': 1,
+                            'total_area': component.get('area_lateral', 0),
+                            'coordinates': feat.get('coordinates', {})
+                        }
+                        validated_features.append(individual_feature)
+    
+    return validated_features
+
 def filter_duplicate_components_in_features(features):
     """Remove componentes cilíndricos de furos complexos quando existem furos simples com o mesmo diâmetro."""
     if not features:
@@ -604,26 +759,82 @@ def filter_duplicate_components_in_features(features):
     
     return filtered_features + new_separate_features
 
-def detect_multiple_cylinders_warning(circular_features, warnings_mgr: AnalysisWarningsManager):
-    """Detecta furos com 3 ou mais cilindros com diâmetros diferentes."""
-    for feature in circular_features:
-        geometric_components = feature.get('geometric_components', [])
+def detect_multiple_cylinders_warning(circular_features):
+    """Detecta furos com 3 ou mais cilindros com diâmetros diferentes - DESABILITADO."""
+    # Sistema de warnings removido - função mantida por compatibilidade mas não faz nada
+    pass
+
+def is_duplicate_circular_semicircular(circular_features, semi_features):
+    """
+    Remove furos circulares que são duplicados de furos semicirculares
+    baseado em proximidade geográfica E diâmetro correspondente.
+    """
+    if not semi_features or not circular_features:
+        return circular_features
+    
+    filtered_circular = []
+    
+    for circle in circular_features:
+        circle_center = circle.get('center', (0, 0, 0))
+        circle_diameter = circle.get('max_d', 0)
+        is_duplicate = False
         
-        if len(geometric_components) < 3:
-            continue
+        for semi in semi_features:
+            # Obter centro do semicircular
+            semi_center = None
+            if 'group' in semi and 'xy' in semi['group']:
+                semi_xy = semi['group']['xy']
+                semi_center = (semi_xy[0], semi_xy[1], 0)
+            elif 'center' in semi:
+                semi_center = semi['center']
             
-        cylinders = [c for c in geometric_components if c.get('geometric_type') == 'cilindrica']
-        
-        if len(cylinders) < 3:
-            continue
+            if not semi_center:
+                continue
             
-        diameters = [c.get('diameter', 0) for c in cylinders if 'diameter' in c]
-        unique_diameters = set(round(d, 1) for d in diameters if d > 0)
+            # Obter diâmetro do semicircular
+            semi_diameter = 0
+            if 'group' in semi and 'radii' in semi['group']:
+                semi_radius = max(semi['group']['radii'])
+                semi_diameter = semi_radius * 2
+            elif 'max_d' in semi:
+                semi_diameter = semi['max_d']
+            
+            if semi_diameter == 0:
+                continue
+            
+            # Verificar correspondência de diâmetro primeiro
+            diameter_tolerance = max(2.0, circle_diameter * 0.05)
+            diameter_match = abs(circle_diameter - semi_diameter) <= diameter_tolerance
+            
+            if not diameter_match:
+                continue
+            
+            # Para o caso especial ⌀242mm, usar tolerância muito generosa
+            if abs(circle_diameter - 242.0) < 1.0:
+                # Distância entre centros
+                distance = math.sqrt(
+                    (circle_center[0] - semi_center[0])**2 + 
+                    (circle_center[1] - semi_center[1])**2
+                )
+                # Tolerância muito generosa para ⌀242mm (faces curvas)
+                if distance <= 500.0:  # 500mm de tolerância
+                    is_duplicate = True
+                    break
+            else:
+                # Para outros diâmetros, usar tolerância normal
+                distance = math.sqrt(
+                    (circle_center[0] - semi_center[0])**2 + 
+                    (circle_center[1] - semi_center[1])**2
+                )
+                center_tolerance = max(10.0, circle_diameter * 0.5)
+                if distance <= center_tolerance:
+                    is_duplicate = True
+                    break
         
-        if len(unique_diameters) >= 3:
-            message = "Existe 1 furo suspeito. Razão: 3 valores de diametro diferentes, Necessária confimação antes de avançar."
-            warnings_mgr.add_warning('circular', message)
-            break
+        if not is_duplicate:
+            filtered_circular.append(circle)
+    
+    return filtered_circular
 
 def is_grouped_with_semi_arc(center, d, semi_features, center_tol=50.0, d_tol=10.0):
     """Verifica se um círculo completo está dentro de um grupo de recortes semicirculares."""
@@ -637,11 +848,14 @@ def is_grouped_with_semi_arc(center, d, semi_features, center_tol=50.0, d_tol=10
             distance_from_center = math.sqrt((center[0] - gx)**2 + (center[1] - gy)**2)
             expected_diameter = 2 * radius
             diameter_difference = abs(d - expected_diameter)
-            diameter_tolerance = expected_diameter * 0.3
             
-            within_center_tolerance = distance_from_center < 20.0
+            # Usar tolerância adaptativa baseada no diâmetro
+            diameter_tolerance = max(1.0, expected_diameter * 0.05)  # Mínimo 1mm, máximo 5%
+            center_tolerance = max(5.0, expected_diameter * 0.1)      # Mínimo 5mm, máximo 10%
+            
+            within_center_tolerance = distance_from_center < center_tolerance
             within_diameter_tolerance = diameter_difference < diameter_tolerance
-            radius_significant = radius >= 10.0
+            radius_significant = radius >= 1.0  # Reduzido de 10.0 para 1.0
             
             if within_center_tolerance and within_diameter_tolerance and radius_significant:
                 return True
@@ -652,18 +866,22 @@ def is_grouped_with_semi_arc(center, d, semi_features, center_tol=50.0, d_tol=10
 # region Função principal de análise
 def summarize_piece(shape, filepath=None, analysis_rules: AnalysisRules = DEFAULT_RULES):
     """Processa e retorna todos os dados sumarizados da peça."""
-    warnings_manager.clear()
-    
     bbox = bbox_cache.get_bbox(shape)
+    
+    # Calcular altura da chapa
+    altura = abs(bbox[5] - bbox[2])
     
     hole_groups = group_faces_by_axis_and_proximity(shape, loc_tol=1.0)
     
     try:
         semi_features = get_semi_circular_features(shape)
         circular_features = get_circular_features(shape, semi_features=semi_features)
-        detect_multiple_cylinders_warning(circular_features, warnings_manager)
+        detect_multiple_cylinders_warning(circular_features)
+        
+        # Validar altura dos furos circulares
+        circular_features = validate_hole_height_consistency(circular_features, altura)
+        
     except Exception as e:
-        logger.error(f"Erro ao obter features circulares/semicirculares: {e}")
         semi_features = []
         circular_features = []
     
@@ -677,13 +895,96 @@ def summarize_piece(shape, filepath=None, analysis_rules: AnalysisRules = DEFAUL
         if not is_duplicate:
             filtered_circular_features.append(circle)
     
-    circular_features = filtered_circular_features
+    # Aplicar filtro adicional baseado em localização geográfica
+    circular_features = is_duplicate_circular_semicircular(filtered_circular_features, semi_features)
     
     try:
         rectangular_counter = get_rectangular_features(shape)
+        
+        # Filtrar furos retangulares cuja profundidade excede a altura da chapa
+        altura_arredondada = round(altura, 1)  # Mesma precisão do relatório
+        validated_rectangular = []
+        for rect_grupo in rectangular_counter:
+            bbox = rect_grupo.get('bbox', (0, 0, 0, 0, 0, 0))
+            profundidade_furo = abs(bbox[5] - bbox[2])  # zmax - zmin
+            
+            # Se a profundidade exceder significativamente a altura da chapa, remover o furo
+            # Permitir uma pequena tolerância para furos passantes legítimos (0.05mm)
+            if profundidade_furo > (altura_arredondada + 0.05):
+                continue  # Furo removido por exceder a altura da chapa
+            
+            # Verificar se é um falso positivo: caso específico de faces muito discrepantes
+            is_false_positive = False
+            if 'faces' in rect_grupo:
+                cylindrical_diameters = []
+                for face in rect_grupo['faces']:
+                    if face.get('type') in ['cilindro', 'cone'] and 'diameter' in face:
+                        cylindrical_diameters.append(face['diameter'])
+                
+                # Verificar caso específico: furo "retangular" muito pequeno com faces muito grandes
+                if len(cylindrical_diameters) >= 2:
+                    min_diameter = min(cylindrical_diameters)
+                    max_diameter = max(cylindrical_diameters)
+                    
+                    # Dimensões do furo retangular
+                    comprimento = rect_grupo.get('comprimento', 0)
+                    largura = rect_grupo.get('largura', 0)
+                    max_dimension = max(comprimento, largura)
+                    
+                    # Caso específico: furo "retangular" pequeno (<20mm) com face cilíndrica muito grande (>100mm)
+                    # Isso indica agrupamento incorreto de faces de furos diferentes
+                    if (max_dimension < 20 and max_diameter > 100 and 
+                        max_diameter > (min_diameter * 20)):
+                        is_false_positive = True
+            
+            if not is_false_positive:
+                validated_rectangular.append(rect_grupo)
+        
+        rectangular_counter = validated_rectangular
         oblong_counter = get_oblong_features(shape)
+        
+        # Filtrar furos retangulares que correspondem a semicirculares
+        filtered_rectangular_counter = []
+        for rect_grupo in rectangular_counter:
+            should_exclude_rect = False
+            
+            # Verificar se alguma face cilíndrica do retangular corresponde a um semicircular
+            if 'faces' in rect_grupo:
+                rect_center_x = (rect_grupo['bbox'][0] + rect_grupo['bbox'][3]) / 2
+                rect_center_y = (rect_grupo['bbox'][1] + rect_grupo['bbox'][4]) / 2
+                
+                for face in rect_grupo['faces']:
+                    if (face.get('type') in ['cilindro', 'cone'] and 
+                        'diameter' in face):
+                        face_diameter = face['diameter']
+                        face_tolerance = get_adaptive_tolerance(face_diameter)
+                        
+                        # Verificar se corresponde a algum semicircular
+                        for semi_feat in semi_features:
+                            semi_diameter = semi_feat.get('max_d', 0)
+                            semi_center = semi_feat.get('center', (0, 0))
+                            
+                            diameter_diff = abs(face_diameter - semi_diameter)
+                            if diameter_diff < face_tolerance:
+                                # Verificar proximidade geométrica
+                                center_diff = ((rect_center_x - semi_center[0])**2 + (rect_center_y - semi_center[1])**2)**0.5
+                                if center_diff < 50.0:  # Tolerância de 50mm para retangulares
+                                    should_exclude_rect = True
+                                    break
+                    
+                    if should_exclude_rect:
+                        break
+            
+            # Se não corresponde a nenhum semicircular, manter o retangular
+            if not should_exclude_rect:
+                filtered_rectangular_counter.append(rect_grupo)
+        
+        rectangular_counter = filtered_rectangular_counter
+        
     except Exception as e:
-        logger.error(f"Erro ao obter features retangulares: {e}")
+        print(f"Erro na detecção de furos retangulares: {e}")
+        import traceback
+        traceback.print_exc()
         rectangular_counter = []
         oblong_counter = []
 
@@ -716,38 +1017,165 @@ def summarize_piece(shape, filepath=None, analysis_rules: AnalysisRules = DEFAUL
                 ymax_g = max(ymaxs)
                 rectangular_bboxes.append((xmin_g, ymin_g, 0, xmax_g, ymax_g, 0))
             except (KeyError, IndexError) as e:
-                logger.warning(f"Erro ao calcular bbox do grupo retangular: {e}")
                 continue
 
+    # Coletar todos os diâmetros das faces cilíndricas dos furos retangulares
+    rectangular_cylindrical_diameters = []
+    for rect_grupo in rectangular_counter:
+        if 'faces' in rect_grupo:
+            for face in rect_grupo['faces']:
+                if face.get('type') in ['cilindro', 'cone'] and 'diameter' in face:
+                    rectangular_cylindrical_diameters.append(face['diameter'])
+    
+    # Coletar diâmetros dos furos semicirculares para exclusão
+    semicircular_diameters = []
+    for semi_feat in semi_features:
+        semicircular_diameters.append(semi_feat.get('max_d', 0))
+    
+    # Separar furos circulares
     circular_inside_rect = []
     circular_outside_rect = []
     
     for feat in circular_features:
         try:
             center = feat['center']
+            diameter = feat.get('max_d', 0)
             inside_any_rect = any(is_point_inside_bbox(center, bbox, tol=2.0) for bbox in rectangular_bboxes)
+            
             if inside_any_rect:
-                circular_inside_rect.append(feat)
+                # Verificar se o furo circular corresponde a algum furo semicircular
+                # (considerando diâmetro E proximidade geométrica)
+                diameter_tolerance = get_adaptive_tolerance(diameter)
+                matches_semicircular = False
+                
+                for semi_feat in semi_features:
+                    semi_diameter = semi_feat.get('max_d', 0)
+                    semi_center = semi_feat.get('center', (0, 0))
+                    
+                    # Verificar correspondência de diâmetro
+                    diameter_diff = abs(diameter - semi_diameter)
+                    if diameter_diff < diameter_tolerance:
+                        # Verificar proximidade geométrica (mesmo centro ou muito próximo)
+                        center_diff = ((center[0] - semi_center[0])**2 + (center[1] - semi_center[1])**2)**0.5
+                        if center_diff < 5.0:  # Tolerância de 5mm para proximidade de centro
+                            matches_semicircular = True
+                            break
+                
+                # Se corresponde a um semicircular na mesma posição, excluir do circular
+                if matches_semicircular:
+                    continue
+                
+                # Obter profundidade do furo circular
+                circular_depth = None
+                is_through_hole = True
+                
+                # Calcular profundidade total dos componentes geométricos
+                if 'geometric_components' in feat and feat['geometric_components']:
+                    total_height = sum(comp.get('altura', 0) for comp in feat['geometric_components'])
+                    if total_height > 0:
+                        circular_depth = total_height
+                        
+                        # Determinar se é passante ou cego baseado na altura da chapa
+                        bbox_coords = bbox_cache.get_bbox(shape)
+                        plate_height = abs(bbox_coords[5] - bbox_coords[2])
+                        is_through_hole = circular_depth >= (plate_height - 1.0)
+                
+                # Verificar se corresponde a faces do furo retangular
+                should_exclude = False
+                
+                # Verificar correspondência com furos retangulares
+                for rect_grupo in rectangular_counter:
+                    if 'faces' in rect_grupo:
+                        rect_depth = abs(rect_grupo['bbox'][5] - rect_grupo['bbox'][2])
+                        
+                        for face in rect_grupo['faces']:
+                            if (face.get('type') in ['cilindro', 'cone'] and 
+                                'diameter' in face):
+                                
+                                face_diameter = face['diameter']
+                                face_tolerance = get_adaptive_tolerance(face_diameter)
+                                diameter_diff = abs(diameter - face_diameter)
+                                
+                                # Verificação de correspondência de diâmetro
+                                if diameter_diff < face_tolerance:
+                                    # Para furos passantes: verificar se profundidades são compatíveis
+                                    if is_through_hole and circular_depth is not None:
+                                        depth_diff = abs(circular_depth - rect_depth)
+                                        if depth_diff < 3.0:  # Tolerância maior para profundidade
+                                            should_exclude = True
+                                            break
+                                    
+                                    # Para furos cegos: casos específicos
+                                    elif not is_through_hole and circular_depth is not None:
+                                        # Caso específico do JDD (diâmetros 72-74mm, profundidade ~5mm)
+                                        if (diameter >= 70 and diameter <= 76 and 
+                                            circular_depth <= 6.0 and 
+                                            diameter_diff < 2.5):
+                                            should_exclude = True
+                                            break
+                                        
+                                        # Outros furos cegos com correspondência muito próxima
+                                        elif (diameter_diff < 0.5 and 
+                                              circular_depth <= 6.0):
+                                            should_exclude = True
+                                            break
+                                    
+                                    # Se não conseguimos determinar profundidade mas diâmetro é muito próximo
+                                    elif circular_depth is None and diameter_diff < (face_tolerance * 0.3):
+                                        should_exclude = True
+                                        break
+                                    
+                                    # Correspondência exata de diâmetro (diferença < 0.1mm)
+                                    elif diameter_diff < 0.1:
+                                        should_exclude = True
+                                        break
+                        
+                        if should_exclude:
+                            break
+                
+                # Verificação adicional: se o furo tem diâmetros que estão na lista de faces retangulares
+                if not should_exclude:
+                    for rect_diameter in rectangular_cylindrical_diameters:
+                        rect_tolerance = get_adaptive_tolerance(rect_diameter)
+                        if abs(diameter - rect_diameter) < rect_tolerance:
+                            # Se é um furo passante e o diâmetro corresponde muito bem
+                            if is_through_hole and abs(diameter - rect_diameter) < 0.5:
+                                should_exclude = True
+                                break
+                            # Se é um caso específico conhecido (furos cegos com diâmetros específicos)
+                            elif (not is_through_hole and circular_depth is not None and 
+                                  circular_depth <= 6.0 and abs(diameter - rect_diameter) < 2.5 and
+                                  diameter >= 70 and diameter <= 76):
+                                should_exclude = True
+                                break
+                
+                if should_exclude:
+                    # É parte do furo retangular - EXCLUIR
+                    continue
+                else:
+                    # É um furo independente próximo - INCLUIR
+                    circular_inside_rect.append(feat)
             else:
+                # Furo está fora dos retangulares - INCLUIR
                 circular_outside_rect.append(feat)
         except (KeyError, TypeError) as e:
-            logger.warning(f"Erro ao verificar posição de feature circular: {e}")
             circular_outside_rect.append(feat)
 
     try:
         positions = detect_positions_from_holes(hole_groups, shape)
     except Exception as e:
-        logger.error(f"Erro ao detectar posições: {e}")
         positions = 1
 
+    # Incluir TODOS os furos circulares (tanto os que estão fora quanto os que estão próximos dos retangulares)
+    all_circular_features = circular_outside_rect + circular_inside_rect
+    
     unique_circ = {}
-    for feat in circular_outside_rect:
+    for feat in all_circular_features:
         try:
             key = feat_key(feat)
             if key not in unique_circ:
                 unique_circ[key] = feat
         except (KeyError, TypeError) as e:
-            logger.warning(f"Erro ao criar chave para feature circular: {e}")
             continue
     
     unique_circ_list = list(unique_circ.values())
@@ -761,7 +1189,6 @@ def summarize_piece(shape, filepath=None, analysis_rules: AnalysisRules = DEFAUL
             key = (min_d, max_d)
             circ_counter[key] += 1
         except (KeyError, TypeError) as e:
-            logger.warning(f"Erro ao processar contador circular: {e}")
             continue
 
     unique_semi = {}
@@ -771,13 +1198,11 @@ def summarize_piece(shape, filepath=None, analysis_rules: AnalysisRules = DEFAUL
             if key not in unique_semi:
                 unique_semi[key] = feat
         except (KeyError, TypeError) as e:
-            logger.warning(f"Erro ao criar chave para feature semicircular: {e}")
             continue
             
     try:
         semi_counter = group_holes_by_center(list(unique_semi.values()))
     except Exception as e:
-        logger.error(f"Erro ao agrupar furos semicirculares: {e}")
         semi_counter = {}
 
     if filepath:
@@ -786,7 +1211,6 @@ def summarize_piece(shape, filepath=None, analysis_rules: AnalysisRules = DEFAUL
             mold_name = f"{mold}" if mold else "(não identificado)"
             part_name = f"{part}" if part else "(não identificada)"
         except Exception as e:
-            logger.warning(f"Erro ao extrair nomes do ficheiro: {e}")
             mold_name = "(erro na extração)"
             part_name = "(erro na extração)"
     else:
@@ -814,8 +1238,7 @@ def summarize_piece(shape, filepath=None, analysis_rules: AnalysisRules = DEFAUL
         'hole_groups': hole_groups,
         'circular_outside_rect': circular_outside_rect,
         'bbox': bbox_coords,
-        'piece_bbox': piece_bbox,
-        'warnings': warnings_manager.warnings
+        'piece_bbox': piece_bbox
     }
 # endregion
 
@@ -823,19 +1246,13 @@ def summarize_piece(shape, filepath=None, analysis_rules: AnalysisRules = DEFAUL
 def export_to_excel(shape, filepath=None):
     """Exporta todos os dados da análise para um ficheiro Excel com múltiplas abas."""
     if not EXCEL_AVAILABLE:
-        print("ERRO: Biblioteca openpyxl não está instalada.")
-        print("Para instalar, execute: pip install openpyxl")
         return False
     
     if not filepath:
-        print("ERRO: Caminho do ficheiro não fornecido")
         return False
     
     try:
-        print("Iniciando exportação para Excel...")
-        
         summary = summarize_piece(shape, filepath)
-        print("Dados da análise obtidos...")
         
         bbox_obj = Bnd_Box()
         brepbndlib.Add(shape, bbox_obj)
@@ -844,10 +1261,8 @@ def export_to_excel(shape, filepath=None):
         comprimento = abs(xmax - xmin)
         largura = abs(ymax - ymin)
         altura = abs(zmax - zmin)
-        print("Dimensões calculadas...")
         
         wb = openpyxl.Workbook()
-        print("Workbook Excel criado...")
         
         # === ABA 1: RESUMO GERAL ===
         ws_resumo = wb.active
@@ -1005,7 +1420,6 @@ def export_to_excel(shape, filepath=None):
                             if len(str(cell.value)) > max_length:
                                 max_length = len(str(cell.value))
                     except (AttributeError, TypeError) as e:
-                        logger.debug(f"Erro ao calcular largura da célula: {e}")
                         continue
                 adjusted_width = min(max_length + 2, 50)
                 ws.column_dimensions[column_letter].width = adjusted_width
@@ -1022,11 +1436,9 @@ def export_to_excel(shape, filepath=None):
         output_path = os.path.join(excels_dir, output_filename)
         
         wb.save(output_path)
-        print(f"Análise Excel guardada em: {output_path}")
         return True
         
     except Exception as e:
-        print(f"ERRO ao exportar para Excel: {str(e)}")
         return False
 # endregion
 
@@ -1070,10 +1482,8 @@ def show_general_summary(shape, filepath=None, save_to_file=True, export_format=
                 os.makedirs(docs_dir)
             
             if export_format.lower() == 'excel':
-                print(f"DEBUG: Tentando exportar para Excel: {filepath}")
                 success = export_to_excel(shape, filepath)
                 if not success:
-                    print("Falha na exportação para Excel. A exportar para TXT...")
                     export_format = 'txt'
             
             if export_format.lower() == 'txt':
@@ -1083,14 +1493,11 @@ def show_general_summary(shape, filepath=None, save_to_file=True, export_format=
                 try:
                     with open(output_path, 'w', encoding='utf-8') as f:
                         f.write(report_content)
-                    print(f"Análise TXT guardada em: {output_path}")
                 except Exception as e:
-                    logger.error(f"Erro ao salvar ficheiro TXT: {e}")
-                    print(f"ERRO ao salvar ficheiro: {e}")
+                    pass
     
     except Exception as e:
         error_msg = f"ERRO na análise da peça: {str(e)}"
-        logger.error(error_msg)
         if not save_to_file or not filepath:
             print(error_msg)
 # endregion

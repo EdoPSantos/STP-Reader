@@ -27,6 +27,7 @@ from OCC.Core.Bnd import Bnd_Box
 import OCC.Core.TopExp
 
 logger = logging.getLogger(__name__)
+logger.disabled = True
 
 # ============================================================================
 # CONSTANTES UNIFICADAS - Eliminação total de duplicações
@@ -38,7 +39,7 @@ TOL_CENTER = 1.0             # Tolerância para centro (main_details.py tinha 1.
 TOL_D = 0.5                  # Tolerância para diâmetro (agrupamento de features)
 TOL_FACE_BORDER = 0.5        # Tolerância para faces na borda
 TOL_PLANAR_HEIGHT = 1.0      # Tolerância para altura mínima de face plana
-TOL_CONEXAO = 1e-3           # Tolerância para ligação de faces
+TOL_CONEXAO = 0.5            # Tolerância para ligação de faces
 
 # Tolerâncias específicas para semicirculares
 GROUP_TOL = 3.0              # Tolerância para agrupamento de semicirculares
@@ -57,40 +58,14 @@ TIPO_TORO = 'toro'
 # FUNÇÕES DE EXTRAÇÃO DE NOMES
 # ============================================================================
 
-def extract_mold_and_part_from_step(filepath):
-    """Extrai nome do molde e peça do ficheiro STEP."""
-    file_mold, file_part = extract_from_filename(filepath)
-    if file_mold and file_part:
-        return file_mold, file_part
-
-    mold, part = None, None
-    product_mold, product_part = None, None
-    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            if "FILE_NAME" in line and (mold is None or part is None):
-                match = re.search(r"FILE_NAME\('([^']+)'", line)
-                if match:
-                    filename = match.group(1)
-                    base = os.path.basename(filename)
-                    name, _ = os.path.splitext(base)
-                    parts = re.split(r"[_\-]", name)
-                    if len(parts) >= 2:
-                        mold = parts[-2]
-                        part = parts[-1]
-            if "PRODUCT('" in line and (product_mold is None or product_part is None):
-                match = re.search(r"PRODUCT\('([^']+)'", line)
-                if match:
-                    pname = match.group(1)
-                    parts = re.split(r"[_\-]", pname)
-                    if len(parts) >= 2:
-                        product_mold = parts[-2]
-                        product_part = parts[-1]
-
-    if mold and part:
-        return mold, part
-    elif product_mold and product_part:
-        return product_mold, product_part
-    return None, None
+def extract_mold_and_part_from_step(filename):
+    base = os.path.splitext(os.path.basename(filename))[0]
+    parts = base.split("_")
+    if len(parts) < 2:
+        raise ValueError("Nome do ficheiro não contém '_' suficiente para extrair Molde e Peça")
+    molde = parts[-2]
+    peca = parts[-1]
+    return molde, peca
 
 def extract_from_filename(filepath):
     """Extrai nome do molde e peça do nome do ficheiro."""
@@ -196,7 +171,6 @@ def get_real_face_angle(face, face_type: str) -> float:
             return calculate_face_angle_and_type(face)['angle']
             
     except Exception as e:
-        logger.warning(f"Erro ao calcular ângulo da face: {e}")
         return 0.0
 
 def calculate_face_angle_and_type(face) -> Dict[str, Any]:
@@ -240,7 +214,6 @@ def calculate_face_angle_and_type(face) -> Dict[str, Any]:
                 else:
                     normal_vec = [0, 0, 1]
             except Exception as e:
-                logger.warning(f"Erro ao calcular normal da face curva: {e}")
                 normal_vec = [0, 0, 1]
         
         vertical_vec = [0, 0, 1]
@@ -257,7 +230,6 @@ def calculate_face_angle_and_type(face) -> Dict[str, Any]:
         }
         
     except Exception as e:
-        logger.warning(f"Erro ao calcular ângulo e tipo da face: {e}")
         return {"angle": 0.0, "type": "desconhecida"}
 
 # ============================================================================
@@ -357,7 +329,6 @@ def has_real_void_in_center(faces, center_point: Tuple[float, float, float],
         return len(faces) >= 3
         
     except Exception as e:
-        logger.warning(f"Erro ao verificar vazio no centro: {e}")
         return True
 
 # ============================================================================

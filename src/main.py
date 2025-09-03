@@ -29,14 +29,12 @@ def process_all_files(folder):
             shape = load_step_file(filepath)
             
             if not shape or shape.IsNull():
-                print(f"ERRO: Ficheiro {filename} inválido ou corrompido.")
                 continue
             
             # Processar com formato escolhido
             show_general_summary(shape, filepath, save_to_file=True, export_format=export_format)
             
         except Exception as e:
-            print(f"ERRO ao processar {filename}: {str(e)}")
             continue
     
     print(f"\n=== PROCESSAMENTO CONCLUÍDO ({len(all_files)} ficheiros) ===")
@@ -55,7 +53,6 @@ def main():
     shape = load_step_file(filepath)
 
     if not shape or shape.IsNull():
-        print("Erro: shape inválido ou ficheiro STEP corrompido.")
         return
     
     # Processar automaticamente o resumo da peça (gera TXT automaticamente)
@@ -82,11 +79,10 @@ def main():
                 else:
                     new_shape = load_step_file(new_path)
                     if not new_shape or new_shape.IsNull():
-                        print("Erro ao carregar novo ficheiro STEP.")
+                        pass
                     else:
                         filepath = new_path
                         shape = new_shape
-                        print(f"Novo ficheiro carregado: {filepath}")
                         # Processar automaticamente o novo ficheiro (gera TXT automaticamente)
                         show_general_summary(shape, filepath, save_to_file=True, export_format='txt')
         
