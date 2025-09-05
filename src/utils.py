@@ -17,13 +17,14 @@ from collections import Counter, defaultdict
 from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Plane, GeomAbs_Sphere, GeomAbs_Torus, GeomAbs_Circle
 from OCC.Core.GeomAdaptor import GeomAdaptor_Surface, GeomAdaptor_Curve
 from OCC.Core.TopAbs import TopAbs_VERTEX, TopAbs_FACE, TopAbs_EDGE
-from OCC.Core.gp import gp_Pnt, gp_Vec
+from OCC.Core.gp import gp_Pnt, gp_Vec, gp_Trsf, gp_Ax1, gp_Dir
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.BRepBndLib import brepbndlib
 from OCC.Core.BRepGProp import brepgprop
 from OCC.Core.GProp import GProp_GProps
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.Bnd import Bnd_Box
+from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Transform
 import OCC.Core.TopExp
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,120 @@ TIPO_CILINDRO = 'cilindro'
 TIPO_CONE = 'cone'
 TIPO_ESFERA = 'esfera'
 TIPO_TORO = 'toro'
+
+# ============================================================================
+# FUNÇÕES DE TRANSFORMAÇÃO GEOMÉTRICA
+# ============================================================================
+
+def normalize_plate_orientation(shape, orientation):
+    """
+    Normaliza a orientação da chapa para que a espessura fique sempre no eixo Z.
+    Se a chapa estiver orientada diferentemente, aplica transformação geométrica.
+    
+    Args:
+        shape: Forma OpenCASCADE original
+        orientation: Dicionário com informações de orientação da placa
+        
+    Returns:
+        shape: Shape normalizada (com espessura sempre em Z)
+    """
+    thickness_axis = orientation['thickness_axis']
+    
+    # Se já está na orientação correta (Z é espessura), não fazer nada
+    if thickness_axis == 'z':
+        return shape
+    
+    # Criar transformação para rotacionar a chapa
+    transform = gp_Trsf()
+    
+    if thickness_axis == 'y':
+        # Y é espessura -> rotacionar 90° em torno do eixo X para Y virar Z
+        axis = gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1, 0, 0))  # Eixo X
+        transform.SetRotation(axis, math.pi / 2)  # 90 graus
+        
+    elif thickness_axis == 'x':
+        # X é espessura -> rotacionar 90° em torno do eixo Y para X virar Z
+        axis = gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0))  # Eixo Y
+        transform.SetRotation(axis, -math.pi / 2)  # -90 graus
+    
+    # Aplicar transformação
+    transformer = BRepBuilderAPI_Transform(shape, transform)
+    transformer.Build()
+    
+    if transformer.IsDone():
+        return transformer.Shape()
+    else:
+        # Se a transformação falhar, retornar shape original
+        return shape
+
+# ============================================================================
+# FUNÇÕES DE ANÁLISE DE ORIENTAÇÃO
+# ============================================================================
+
+def determine_plate_orientation(bbox):
+    """
+    Determina a orientação da chapa baseado no bounding box.
+    Retorna mapeamento de eixos X/Y/Z para comprimento/largura/altura.
+    
+    Args:
+        bbox: Tuple com (xmin, ymin, zmin, xmax, ymax, zmax)
+    
+    Returns:
+        Dict com:
+        - thickness_axis: string ('x', 'y', ou 'z') que representa a espessura
+        - comprimento: valor da maior dimensão
+        - largura: valor da segunda maior dimensão  
+        - altura: valor da menor dimensão (espessura)
+        - x_is: string com papel do eixo X
+        - y_is: string com papel do eixo Y
+        - z_is: string com papel do eixo Z
+    """
+    if not bbox or len(bbox) != 6:
+        return {
+            'thickness_axis': 'z',
+            'comprimento': 0,
+            'largura': 0,
+            'altura': 0,
+            'x_is': 'comprimento',
+            'y_is': 'largura',
+            'z_is': 'altura'
+        }
+    
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox
+    
+    # Calcular dimensões
+    x_dim = abs(xmax - xmin)
+    y_dim = abs(ymax - ymin) 
+    z_dim = abs(zmax - zmin)
+    
+    # Ordenar dimensões da maior para a menor
+    dimensions = [
+        ('x', x_dim),
+        ('y', y_dim),
+        ('z', z_dim)
+    ]
+    dimensions.sort(key=lambda x: x[1], reverse=True)
+    
+    # A menor dimensão é sempre a espessura
+    comprimento_axis, comprimento = dimensions[0]
+    largura_axis, largura = dimensions[1]
+    altura_axis, altura = dimensions[2]
+    
+    # Criar mapeamento
+    axis_roles = {}
+    axis_roles[comprimento_axis] = 'comprimento'
+    axis_roles[largura_axis] = 'largura'
+    axis_roles[altura_axis] = 'altura'
+    
+    return {
+        'thickness_axis': altura_axis,
+        'comprimento': round(comprimento, 2),
+        'largura': round(largura, 2),
+        'altura': round(altura, 2),
+        'x_is': axis_roles['x'],
+        'y_is': axis_roles['y'],
+        'z_is': axis_roles['z']
+    }
 
 # ============================================================================
 # FUNÇÕES DE EXTRAÇÃO DE NOMES
@@ -372,7 +487,13 @@ def group_faces_by_axis_and_proximity(shape, loc_tol=2.0, dir_tol=0.05):
     """
     NOVA ABORDAGEM: Recolhe todas as faces curvas, verifica limites da chapa,
     agrupa similar aos retângulos, depois analisa geometria para identificar cilindros/cones.
+    Detecta automaticamente a orientação da chapa para usar o eixo correto.
     """
+    # DETECTAR ORIENTAÇÃO DA CHAPA PRIMEIRO
+    chapa_bbox = get_bbox(shape)
+    plate_orientation = determine_plate_orientation(chapa_bbox)
+    thickness_axis = plate_orientation['thickness_axis']
+    
     # 1. RECOLHER todas as faces curvas da shape
     all_curved_faces = []
     explorer = TopExp_Explorer(shape, TopAbs_FACE)
@@ -421,17 +542,68 @@ def group_faces_by_axis_and_proximity(shape, loc_tol=2.0, dir_tol=0.05):
         
         explorer.Next()
     
-    # 2. VERIFICAR LIMITES DA CHAPA
+    # 2. VERIFICAR LIMITES DA CHAPA E FILTRAR FACES NAS BORDAS/CANTOS
     chapa_bbox = get_bbox(shape)
     xmin_c, ymin_c, zmin_c, xmax_c, ymax_c, zmax_c = chapa_bbox
     
-    largura_chapa = abs(xmax_c - xmin_c)
-    altura_chapa = abs(ymax_c - ymin_c)
-    espessura_chapa = abs(zmax_c - zmin_c)
+    # Usar orientação detectada para configurar tolerâncias corretas
+    comprimento = plate_orientation['comprimento']
+    largura = plate_orientation['largura'] 
+    espessura = plate_orientation['altura']
     
-    tol_limite_x = min(10.0, largura_chapa * 0.02)
-    tol_limite_y = min(10.0, altura_chapa * 0.02)
-    tol_limite_z = min(5.0, espessura_chapa * 0.5)
+    # Tolerâncias baseadas na orientação real da chapa
+    if thickness_axis == 'x':
+        # Espessura é X, comprimento/largura são Y/Z
+        tol_espessura = min(5.0, espessura * 0.8)  # Muito restritiva para espessura
+        tol_comprimento = min(10.0, max(largura, comprimento) * 0.02)
+        tol_largura = min(10.0, min(largura, comprimento) * 0.02)
+        
+        tol_limite_x = tol_espessura
+        tol_limite_y = tol_largura if abs(ymax_c - ymin_c) < abs(zmax_c - zmin_c) else tol_comprimento
+        tol_limite_z = tol_comprimento if abs(zmax_c - zmin_c) > abs(ymax_c - ymin_c) else tol_largura
+        
+    elif thickness_axis == 'y':
+        # Espessura é Y, comprimento/largura são X/Z
+        tol_espessura = min(5.0, espessura * 0.8)  # Muito restritiva para espessura
+        tol_comprimento = min(10.0, max(largura, comprimento) * 0.02)
+        tol_largura = min(10.0, min(largura, comprimento) * 0.02)
+        
+        tol_limite_y = tol_espessura
+        tol_limite_x = tol_largura if abs(xmax_c - xmin_c) < abs(zmax_c - zmin_c) else tol_comprimento
+        tol_limite_z = tol_comprimento if abs(zmax_c - zmin_c) > abs(xmax_c - xmin_c) else tol_largura
+        
+    else:  # thickness_axis == 'z' (orientação normal)
+        # Espessura é Z, comprimento/largura são X/Y
+        tol_espessura = min(5.0, espessura * 0.8)  # Muito restritiva para espessura
+        tol_comprimento = min(10.0, max(largura, comprimento) * 0.02)
+        tol_largura = min(10.0, min(largura, comprimento) * 0.02)
+        
+        tol_limite_z = tol_espessura
+        tol_limite_x = tol_largura if abs(xmax_c - xmin_c) < abs(ymax_c - ymin_c) else tol_comprimento
+        tol_limite_y = tol_comprimento if abs(ymax_c - ymin_c) > abs(xmax_c - xmin_c) else tol_largura
+    
+    # Tolerância mais rigorosa para detectar faces nas bordas/cantos baseada na orientação
+    if thickness_axis == 'x':
+        # X é espessura, Y e Z são as outras dimensões
+        dim_y = abs(ymax_c - ymin_c)
+        dim_z = abs(zmax_c - zmin_c)
+        tol_borda_y = min(8.0, dim_y * 0.015)  # 1.5% da dimensão Y, max 8mm  
+        tol_borda_z = min(8.0, dim_z * 0.015)  # 1.5% da dimensão Z, max 8mm
+        tol_borda_x = min(3.0, espessura * 0.4)  # 40% da espessura, max 3mm
+    elif thickness_axis == 'y':
+        # Y é espessura, X e Z são as outras dimensões  
+        dim_x = abs(xmax_c - xmin_c)
+        dim_z = abs(zmax_c - zmin_c)
+        tol_borda_x = min(8.0, dim_x * 0.015)  # 1.5% da dimensão X, max 8mm
+        tol_borda_z = min(8.0, dim_z * 0.015)  # 1.5% da dimensão Z, max 8mm
+        tol_borda_y = min(3.0, espessura * 0.4)  # 40% da espessura, max 3mm
+    else:  # thickness_axis == 'z'
+        # Z é espessura, X e Y são as outras dimensões
+        dim_x = abs(xmax_c - xmin_c)
+        dim_y = abs(ymax_c - ymin_c)
+        tol_borda_x = min(8.0, dim_x * 0.015)  # 1.5% da dimensão X, max 8mm  
+        tol_borda_y = min(8.0, dim_y * 0.015)  # 1.5% da dimensão Y, max 8mm
+        tol_borda_z = min(3.0, espessura * 0.4)  # 40% da espessura, max 3mm
     
     faces_dentro_limites = []
     for face_data in all_curved_faces:
@@ -440,9 +612,48 @@ def group_faces_by_axis_and_proximity(shape, loc_tol=2.0, dir_tol=0.05):
         
         face_xmin, face_ymin, face_zmin, face_xmax, face_ymax, face_zmax = face_bbox
         
+        # Verificar se a face está muito próxima das bordas (possível canto/borda)
+        near_left_edge = abs(cx - xmin_c) < tol_borda_x
+        near_right_edge = abs(cx - xmax_c) < tol_borda_x  
+        near_bottom_edge = abs(cy - ymin_c) < tol_borda_y
+        near_top_edge = abs(cy - ymax_c) < tol_borda_y
+        near_front_edge = abs(cz - zmin_c) < tol_borda_z
+        near_back_edge = abs(cz - zmax_c) < tol_borda_z
+        
+        # Para diferentes orientações, verificar cantos baseado no eixo da espessura
+        if thickness_axis == 'x':
+            # Espessura em X: cantos são combinações de Y e Z
+            is_corner = (near_bottom_edge or near_top_edge) and (near_front_edge or near_back_edge)
+        elif thickness_axis == 'y':
+            # Espessura em Y: cantos são combinações de X e Z
+            is_corner = (near_left_edge or near_right_edge) and (near_front_edge or near_back_edge)
+        else:  # thickness_axis == 'z'
+            # Espessura em Z: cantos são combinações de X e Y (comportamento original)
+            is_corner = (near_left_edge or near_right_edge) and (near_bottom_edge or near_top_edge)
+        
+        # Verificação adicional: aplicar detecção rigorosa apenas para chapas pequenas e finas
+        is_small_thin_plate = (comprimento < 300 and largura < 200 and espessura < 5)
+        
+        if is_small_thin_plate:
+            # Para chapas pequenas e finas, aplicar critérios mais rigorosos
+            edges_touched = sum([near_left_edge, near_right_edge, near_bottom_edge, near_top_edge, near_front_edge, near_back_edge])
+            is_multi_edge = edges_touched >= 2  # Se toca 2 ou mais bordas, é suspeita de ser canto
+            
+            # Verificação de tamanho: faces muito pequenas próximas das bordas são suspeitas
+            face_area = face_data.get('area', 0)
+            is_small_near_edge = face_area < 30.0 and edges_touched >= 1  # Face pequena (<30mm²) próxima de bordas
+            
+            # Combinação: é canto se satisfaz qualquer critério rigoroso EM CHAPAS PEQUENAS
+            is_probable_corner = is_corner or is_multi_edge or is_small_near_edge
+        else:
+            # Para chapas grandes, usar apenas a detecção básica de cantos
+            is_probable_corner = is_corner
+        
+        # Verificar se está dentro dos limites e não é um canto
         if (face_xmin >= xmin_c - tol_limite_x and face_xmax <= xmax_c + tol_limite_x and
             face_ymin >= ymin_c - tol_limite_y and face_ymax <= ymax_c + tol_limite_y and
-            face_zmin >= zmin_c - tol_limite_z and face_zmax <= zmax_c + tol_limite_z):
+            face_zmin >= zmin_c - tol_limite_z and face_zmax <= zmax_c + tol_limite_z and
+            not is_probable_corner):
             faces_dentro_limites.append(face_data)
     
     # 3. AGRUPAR faces
@@ -510,7 +721,7 @@ def group_faces_by_axis_and_proximity(shape, loc_tol=2.0, dir_tol=0.05):
                     faces_corretas.append(face_data)
             
             if faces_corretas:
-                geometric_analysis = analyze_group_geometry(faces_corretas)
+                geometric_analysis = analyze_group_geometry(faces_corretas, thickness_axis)
                 
                 group_with_analysis = []
                 for face_data in faces_corretas:
@@ -526,27 +737,37 @@ def group_faces_by_axis_and_proximity(shape, loc_tol=2.0, dir_tol=0.05):
     
     return analyzed_groups
 
-def analyze_group_geometry(grupo):
+def analyze_group_geometry(grupo, thickness_axis='z'):
     """
     Analisa um grupo de faces para determinar a geometria real:
-    - Se o raio é constante ao longo de Z = CILINDRO
-    - Se o raio varia ao longo de Z = CONE
+    - Se o raio é constante ao longo do eixo da espessura = CILINDRO
+    - Se o raio varia ao longo do eixo da espessura = CONE
+    
+    Args:
+        grupo: Lista de faces do grupo
+        thickness_axis: Eixo da espessura da chapa ('x', 'y', ou 'z')
     """
     if not grupo:
         return {'type': 'unknown', 'components': []}
     
+    # Usar o eixo da espessura fornecido em vez de detectar automaticamente
+    axis_indices = {'x': (0, 3), 'y': (1, 4), 'z': (2, 5)}
+    thickness_min_idx, thickness_max_idx = axis_indices[thickness_axis]
+    
     face_info = []
     for face_data in grupo:
         bbox = face_data['bbox']
-        zmin, zmax = bbox[2], bbox[5]
-        z_center = (zmin + zmax) / 2
+        
+        # Usar o eixo correto baseado no thickness_axis fornecido
+        axis_min, axis_max = bbox[thickness_min_idx], bbox[thickness_max_idx]
+        axis_center = (axis_min + axis_max) / 2
         
         if face_data['type'] == GeomAbs_Cylinder:
             radius = face_data['radius']
             face_info.append({
-                'z_min': zmin,
-                'z_max': zmax,
-                'z_center': z_center,
+                'axis_min': axis_min,
+                'axis_max': axis_max,
+                'axis_center': axis_center,
                 'radius': radius,
                 'type': 'cylinder',
                 'face_data': face_data
@@ -558,46 +779,51 @@ def analyze_group_geometry(grupo):
             apex = cone.Apex()
             axis = cone.Axis()
             
-            height = abs(zmax - zmin)
+            height = abs(axis_max - axis_min)
             
-            apex_z = apex.Z()
+            # Calcular posição do apex no eixo da espessura
+            if thickness_axis == 'x':
+                apex_coord = apex.X()
+            elif thickness_axis == 'y':
+                apex_coord = apex.Y()
+            else:
+                apex_coord = apex.Z()
             
-            dist_to_zmin = abs(zmin - apex_z)
-            dist_to_zmax = abs(zmax - apex_z)
+            dist_to_min = abs(axis_min - apex_coord)
+            dist_to_max = abs(axis_max - apex_coord)
             
-            r_at_zmin = dist_to_zmin * math.tan(semi_angle)
-            r_at_zmax = dist_to_zmax * math.tan(semi_angle)
+            r_at_min = dist_to_min * math.tan(semi_angle)
+            r_at_max = dist_to_max * math.tan(semi_angle)
             
-            if r_at_zmin < 0:
-                r_at_zmin = abs(r_at_zmin)
-            if r_at_zmax < 0:
-                r_at_zmax = abs(r_at_zmax)
+            if r_at_min < 0:
+                r_at_min = abs(r_at_min)
+            if r_at_max < 0:
+                r_at_max = abs(r_at_max)
             
-            apex_z = face_data.get('apex_z', z_center)
-            z_mid = (zmin + zmax) / 2
+            axis_mid = (axis_min + axis_max) / 2
             
-            if abs(r_at_zmax - r_at_zmin) < 0.01:
-                if apex_z < z_mid:
+            if abs(r_at_max - r_at_min) < 0.01:
+                if apex_coord < axis_mid:
                     direction = 'expanding'
                 else:
                     direction = 'contracting'
             else:
-                direction = 'expanding' if r_at_zmax > r_at_zmin else 'contracting'
+                direction = 'expanding' if r_at_max > r_at_min else 'contracting'
             
             face_info.append({
-                'z_min': zmin,
-                'z_max': zmax,
-                'z_center': z_center,
-                'radius_min': min(r_at_zmin, r_at_zmax),
-                'radius_max': max(r_at_zmin, r_at_zmax),
-                'radius_at_zmin': r_at_zmin,
-                'radius_at_zmax': r_at_zmax,
+                'axis_min': axis_min,
+                'axis_max': axis_max,
+                'axis_center': axis_center,
+                'radius_min': min(r_at_min, r_at_max),
+                'radius_max': max(r_at_min, r_at_max),
+                'radius_at_min': r_at_min,
+                'radius_at_max': r_at_max,
                 'type': 'cone',
                 'direction': direction,
                 'face_data': face_data
             })
     
-    face_info.sort(key=lambda x: x['z_center'])
+    face_info.sort(key=lambda x: x['axis_center'])
     
     components = []
     
@@ -605,25 +831,25 @@ def analyze_group_geometry(grupo):
         if info['type'] == 'cylinder':
             components.append({
                 'geometric_type': 'cilindrica',
-                'z_min': round(info['z_min'], 1),
-                'z_max': round(info['z_max'], 1),
+                'z_min': round(info['axis_min'], 1),  # Manter z_min/z_max para compatibilidade
+                'z_max': round(info['axis_max'], 1),
                 'radius': round(info['radius'], 2),
                 'diameter': round(info['radius'] * 2, 2),
-                'altura': round(abs(info['z_max'] - info['z_min']), 2),
-                'area_lateral': round(2 * math.pi * info['radius'] * abs(info['z_max'] - info['z_min']), 2),
-                'volume': round(math.pi * info['radius']**2 * abs(info['z_max'] - info['z_min']), 2),
+                'altura': round(abs(info['axis_max'] - info['axis_min']), 2),
+                'area_lateral': round(2 * math.pi * info['radius'] * abs(info['axis_max'] - info['axis_min']), 2),
+                'volume': round(math.pi * info['radius']**2 * abs(info['axis_max'] - info['axis_min']), 2),
                 'face_data': info['face_data']
             })
         elif info['type'] == 'cone':
             components.append({
                 'geometric_type': 'conica',
-                'z_min': round(info['z_min'], 1),
-                'z_max': round(info['z_max'], 1),
+                'z_min': round(info['axis_min'], 1),  # Manter z_min/z_max para compatibilidade
+                'z_max': round(info['axis_max'], 1),
                 'radius_min': round(info['radius_min'], 2),
                 'radius_max': round(info['radius_max'], 2),
                 'diameter_min': round(info['radius_min'] * 2, 2),
                 'diameter_max': round(info['radius_max'] * 2, 2),
-                'altura': round(abs(info['z_max'] - info['z_min']), 2),
+                'altura': round(abs(info['axis_max'] - info['axis_min']), 2),
                 'direction': info['direction'],
                 'apex_angle': round(math.degrees(info['face_data']['semi_angle'] * 2), 1),
                 'conicidade': round(math.degrees(info['face_data']['semi_angle']), 1),

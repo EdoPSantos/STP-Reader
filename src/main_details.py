@@ -33,7 +33,7 @@ from .data_structures import (
 )
 from .utils import (
     # Funções de ângulos e orientação
-    calculate_face_angle_from_dimensions, angle_to_word,
+    calculate_face_angle_from_dimensions, angle_to_word, determine_plate_orientation, normalize_plate_orientation,
     # Funções de validação geométrica
     has_real_void_in_center, normalize_grouping_values,
     # Funções de bounding box
@@ -866,16 +866,26 @@ def is_grouped_with_semi_arc(center, d, semi_features, center_tol=50.0, d_tol=10
 # region Função principal de análise
 def summarize_piece(shape, filepath=None, analysis_rules: AnalysisRules = DEFAULT_RULES):
     """Processa e retorna todos os dados sumarizados da peça."""
-    bbox = bbox_cache.get_bbox(shape)
+    # Primeiro determinar a orientação original
+    original_bbox = get_bbox(shape)
+    original_orientation = determine_plate_orientation(original_bbox)
     
-    # Calcular altura da chapa
-    altura = abs(bbox[5] - bbox[2])
+    # Normalizar a orientação da chapa - sempre colocar espessura no eixo Z
+    normalized_shape = normalize_plate_orientation(shape, original_orientation)
     
-    hole_groups = group_faces_by_axis_and_proximity(shape, loc_tol=1.0)
+    # Recalcular bbox após normalização
+    bbox = get_bbox(normalized_shape)
+    
+    # Agora a orientação será sempre padrão (espessura em Z)
+    orientation = determine_plate_orientation(bbox)
+    altura = orientation['altura']  # A menor dimensão, agora sempre em Z
+    thickness_axis = 'z'  # Sempre Z após normalização
+    
+    hole_groups = group_faces_by_axis_and_proximity(normalized_shape, loc_tol=1.0)
     
     try:
-        semi_features = get_semi_circular_features(shape)
-        circular_features = get_circular_features(shape, semi_features=semi_features)
+        semi_features = get_semi_circular_features(normalized_shape)
+        circular_features = get_circular_features(normalized_shape, semi_features=semi_features)
         detect_multiple_cylinders_warning(circular_features)
         
         # Validar altura dos furos circulares
@@ -899,14 +909,17 @@ def summarize_piece(shape, filepath=None, analysis_rules: AnalysisRules = DEFAUL
     circular_features = is_duplicate_circular_semicircular(filtered_circular_features, semi_features)
     
     try:
-        rectangular_counter = get_rectangular_features(shape)
+        rectangular_counter = get_rectangular_features(normalized_shape)
         
         # Filtrar furos retangulares cuja profundidade excede a altura da chapa
         altura_arredondada = round(altura, 1)  # Mesma precisão do relatório
         validated_rectangular = []
+        axis_index = {'x': [0, 3], 'y': [1, 4], 'z': [2, 5]}[thickness_axis]
+        
         for rect_grupo in rectangular_counter:
             bbox = rect_grupo.get('bbox', (0, 0, 0, 0, 0, 0))
-            profundidade_furo = abs(bbox[5] - bbox[2])  # zmax - zmin
+            # Usar o eixo correto para calcular profundidade
+            profundidade_furo = abs(bbox[axis_index[1]] - bbox[axis_index[0]])
             
             # Se a profundidade exceder significativamente a altura da chapa, remover o furo
             # Permitir uma pequena tolerância para furos passantes legítimos (0.05mm)
@@ -941,7 +954,7 @@ def summarize_piece(shape, filepath=None, analysis_rules: AnalysisRules = DEFAUL
                 validated_rectangular.append(rect_grupo)
         
         rectangular_counter = validated_rectangular
-        oblong_counter = get_oblong_features(shape)
+        oblong_counter = get_oblong_features(normalized_shape)
         
         # Filtrar furos retangulares que correspondem a semicirculares
         filtered_rectangular_counter = []
@@ -989,7 +1002,7 @@ def summarize_piece(shape, filepath=None, analysis_rules: AnalysisRules = DEFAUL
         oblong_counter = []
 
     bbox_obj = Bnd_Box()
-    brepbndlib.Add(shape, bbox_obj)
+    brepbndlib.Add(normalized_shape, bbox_obj)
     bbox_coords = bbox_obj.Get()
     
     piece_bbox = BoundingBox(*bbox_coords)
@@ -1076,7 +1089,7 @@ def summarize_piece(shape, filepath=None, analysis_rules: AnalysisRules = DEFAUL
                         circular_depth = total_height
                         
                         # Determinar se é passante ou cego baseado na altura da chapa
-                        bbox_coords = bbox_cache.get_bbox(shape)
+                        bbox_coords = get_bbox(normalized_shape)
                         plate_height = abs(bbox_coords[5] - bbox_coords[2])
                         is_through_hole = circular_depth >= (plate_height - 1.0)
                 

@@ -9,7 +9,7 @@ from collections import defaultdict, Counter
 from .data_structures import AnalysisWarning
 from .utils import (
     angle_to_word, calculate_face_angle_from_dimensions,
-    get_bbox, get_face_area, is_hole_through
+    get_bbox, get_face_area, is_hole_through, determine_plate_orientation
 )
 import logging
 
@@ -22,10 +22,11 @@ def format_piece_header(summary: Dict[str, Any]) -> str:
     if not bbox:
         return "ERRO: Informações de bbox não disponíveis"
     
-    xmin, ymin, zmin, xmax, ymax, zmax = bbox
-    comprimento = abs(xmax - xmin)
-    largura = abs(ymax - ymin)
-    altura = abs(zmax - zmin)
+    # Determinar orientação automática
+    orientation = determine_plate_orientation(bbox)
+    comprimento = orientation['comprimento']
+    largura = orientation['largura']
+    altura = orientation['altura']
     
     header = []
     header.append("=" * 40)
@@ -96,7 +97,9 @@ def format_circular_holes(summary: Dict[str, Any], shape, axis_groups: List[Any]
     
     if circ_counter:
         bbox = summary.get('bbox')
-        altura_chapa = abs(bbox[5] - bbox[2]) if bbox else 0
+        # Determinar orientação para calcular espessura correta
+        orientation = determine_plate_orientation(bbox)
+        altura_chapa = orientation['altura']
         
         for (min_d, max_d), count_from_counter in sorted(circ_counter.items(), key=lambda x: -x[0][1]):
             grupo_feats = [feat for feat in unique_circ_list 
@@ -109,7 +112,7 @@ def format_circular_holes(summary: Dict[str, Any], shape, axis_groups: List[Any]
             features_detalhadas = []
             
             for feat in grupo_feats:
-                feature_info = _process_circular_feature(feat, axis_groups, shape, altura_chapa)
+                feature_info = _process_circular_feature(feat, axis_groups, shape, orientation)
                 if feature_info:  # Filtrar furos com profundidade < 1mm
                     features_detalhadas.append(feature_info)
                     if feature_info.get('direcao'):
@@ -125,7 +128,7 @@ def format_circular_holes(summary: Dict[str, Any], shape, axis_groups: List[Any]
     return "\n".join(output), todas_direcoes_globais
 
 def _process_circular_feature(feat: Dict[str, Any], axis_groups: List[Any], 
-                             shape, altura_chapa: float) -> Dict[str, Any]:
+                             shape, orientation: Dict[str, Any]) -> Dict[str, Any]:
     """Processa uma feature circular individual."""
     center = feat['center']
     
@@ -155,7 +158,7 @@ def _process_circular_feature(feat: Dict[str, Any], axis_groups: List[Any],
             break
     
     # Calcular profundidade e tipo
-    profundidade, tipo = _calculate_hole_depth_and_type(feat, matching_group, shape, altura_chapa)
+    profundidade, tipo = _calculate_hole_depth_and_type(feat, matching_group, shape, orientation)
     
     # Filtrar furos muito pequenos
     if isinstance(profundidade, (int, float)) and profundidade < 1.0:
@@ -176,7 +179,7 @@ def _process_circular_feature(feat: Dict[str, Any], axis_groups: List[Any],
     area_display = area_real if tipo == "cego" else None
     
     # Analisar componentes geométricos
-    components_info, direcao = _analyze_geometric_components(feat, eh_furo_escalonado, tipo, altura_chapa)
+    components_info, direcao = _analyze_geometric_components(feat, eh_furo_escalonado, tipo, orientation)
     
     return {
         'actual_min_d': actual_min_d,
@@ -190,27 +193,56 @@ def _process_circular_feature(feat: Dict[str, Any], axis_groups: List[Any],
         'direcao': direcao
     }
 
-def _calculate_hole_depth_and_type(feat: Dict[str, Any], matching_group, shape, altura_chapa: float) -> Tuple[Any, str]:
-    """Calcula profundidade e tipo do furo."""
+def _calculate_hole_depth_and_type(feat: Dict[str, Any], matching_group, shape, orientation: Dict[str, Any]) -> Tuple[Any, str]:
+    """Calcula profundidade e tipo do furo usando orientação automática."""
     profundidade = 'n/d'
     tipo = "passante"
+    altura_chapa = orientation['altura']
+    thickness_axis = orientation['thickness_axis']
     
     if matching_group:
         is_through = is_hole_through(matching_group, shape)
         
-        if 'coordinates' in feat and feat['coordinates'] and 'z_range' in feat['coordinates']:
-            profundidade = feat['coordinates']['z_range'].get('height', 'n/d')
+        if 'coordinates' in feat and feat['coordinates']:
+            coords = feat['coordinates']
+            
+            # Para furos, a profundidade é sempre a extensão no eixo da espessura
+            # Se thickness_axis = 'y', então a profundidade do furo é a variação em Y
+            if thickness_axis == 'x':
+                if 'bounding_coords' in coords:
+                    bbox_coords = coords['bounding_coords']
+                    profundidade = abs(bbox_coords.get('x_max', 0) - bbox_coords.get('x_min', 0))
+                elif 'z_range' in coords:  # Fallback
+                    profundidade = coords['z_range'].get('height', altura_chapa)
+            elif thickness_axis == 'y':
+                if 'bounding_coords' in coords:
+                    bbox_coords = coords['bounding_coords']
+                    profundidade = abs(bbox_coords.get('y_max', 0) - bbox_coords.get('y_min', 0))
+                elif 'z_range' in coords:  # Fallback
+                    profundidade = coords['z_range'].get('height', altura_chapa)
+            else:  # thickness_axis == 'z' (orientação normal)
+                if 'z_range' in coords:
+                    profundidade = coords['z_range'].get('height', 'n/d')
+                else:
+                    profundidade = altura_chapa
+                
             if isinstance(profundidade, (int, float)):
                 profundidade = round(profundidade, 2)
         else:
-            # Fallback: calcular baseado no bbox
-            all_z_values = []
+            # Fallback: calcular baseado no bbox usando o eixo correto
+            all_axis_values = []
+            axis_index = {'x': [0, 3], 'y': [1, 4], 'z': [2, 5]}[thickness_axis]
+            
             for face_tuple in matching_group:
                 face = face_tuple[1]
                 face_bbox = get_bbox(face)
-                all_z_values.extend([face_bbox[2], face_bbox[5]])
-            if all_z_values:
-                profundidade = round(abs(max(all_z_values) - min(all_z_values)), 2)
+                all_axis_values.extend([face_bbox[axis_index[0]], face_bbox[axis_index[1]]])
+                
+            if all_axis_values:
+                profundidade = round(abs(max(all_axis_values) - min(all_axis_values)), 2)
+            else:
+                # Se não conseguir calcular, usar a espessura da chapa
+                profundidade = altura_chapa
         
         # Determinar tipo baseado na profundidade
         if isinstance(profundidade, (int, float)):
@@ -254,10 +286,12 @@ def _calculate_feature_diameters(feat: Dict[str, Any]) -> Tuple[float, float, bo
     return actual_min_d, actual_max_d, eh_furo_escalonado
 
 def _analyze_geometric_components(feat: Dict[str, Any], eh_furo_escalonado: bool, 
-                                 tipo: str, altura_chapa: float) -> Tuple[List[str], str]:
+                                 tipo: str, orientation: Dict[str, Any]) -> Tuple[List[str], str]:
     """Analisa componentes geométricos e determina direção."""
     components_info = []
     direcao = None
+    altura_chapa = orientation['altura']
+    thickness_axis = orientation['thickness_axis']
 
     # Agrupar componentes consecutivos do mesmo tipo e diâmetro/intervalo
     if 'geometric_components' in feat and feat['geometric_components']:
@@ -291,10 +325,28 @@ def _analyze_geometric_components(feat: Dict[str, Any], eh_furo_escalonado: bool
             elif g['type'] == 'conica':
                 components_info.append(f"Cônico ⌀{g['key'][1]:.1f}-{g['key'][2]:.1f}mm h{g['altura']:.1f}mm")
 
-    # Determinar direção para furos cegos baseado na posição Z
+    # Determinar direção para furos cegos baseado na posição no eixo da espessura
     if tipo == "cego" and 'coordinates' in feat and feat['coordinates']:
         coords = feat['coordinates']
-        if 'z_range' in coords:
+        
+        # Usar o eixo correto baseado na orientação
+        if thickness_axis == 'x' and 'bounding_coords' in coords:
+            bbox_coords = coords['bounding_coords']
+            min_val = bbox_coords.get('x_min', 0)
+            max_val = bbox_coords.get('x_max', altura_chapa)
+            if abs(max_val - altura_chapa) < abs(min_val - 0):
+                direcao = "↓"
+            else:
+                direcao = "↑"
+        elif thickness_axis == 'y' and 'bounding_coords' in coords:
+            bbox_coords = coords['bounding_coords']
+            min_val = bbox_coords.get('y_min', 0)
+            max_val = bbox_coords.get('y_max', altura_chapa)
+            if abs(max_val - altura_chapa) < abs(min_val - 0):
+                direcao = "↓"
+            else:
+                direcao = "↑"
+        elif 'z_range' in coords:  # thickness_axis == 'z' ou fallback
             z_min = coords['z_range'].get('min', 0)
             z_max = coords['z_range'].get('max', altura_chapa)
             if abs(z_max - altura_chapa) < abs(z_min - 0):
@@ -381,7 +433,8 @@ def format_semicircular_holes(summary: Dict[str, Any], shape) -> str:
     semi_counter = summary['semi_counter']
     if semi_counter:
         bbox = summary.get('bbox')
-        altura_chapa = abs(bbox[5] - bbox[2]) if bbox else 0
+        orientation = determine_plate_orientation(bbox)
+        altura_chapa = orientation['altura']
         semi_features = get_semi_circular_features(shape)
         
         for (min_d, max_d), _ in sorted(semi_counter.items(), key=lambda x: -x[0][1]):
@@ -470,7 +523,8 @@ def format_rectangular_holes(summary: Dict[str, Any], shape) -> str:
     rectangular_counter = summary['rectangular_counter']
     if rectangular_counter:
         bbox = summary.get('bbox')
-        altura = abs(bbox[5] - bbox[2]) if bbox else 0
+        orientation = determine_plate_orientation(bbox)
+        altura = orientation['altura']
         
         for i, grupo in enumerate(rectangular_counter, 1):
             rect_text = _format_single_rectangular_hole(grupo, i, shape, altura)
